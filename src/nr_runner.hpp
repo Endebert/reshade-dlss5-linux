@@ -1257,6 +1257,27 @@ inline void SubmitStandalone(ID3D12CommandQueue* game_queue) {
   game_queue->Wait(s.sa_fence_out, v);
 }
 
+// The Vulkan transport's variant: the CPU orders the two APIs. The game's queue was drained
+// before the pass was recorded; this runs the pass and waits for it, so the copy back that the
+// caller records next sees the result. Returns false if nothing ran or it did not finish.
+inline bool SubmitStandaloneAndWait(DWORD timeout_ms) {
+  if (!s.sa_pending) return false;
+  s.sa_pending = false;
+  if (FAILED(s.sa_list->Close())) {
+    GiveUp("standalone: command list failed to close");
+    return false;
+  }
+  const UINT64 v = ++s.sa_value;
+  s.sa_alloc_value[(v - 1) % 3] = v;
+  ID3D12CommandList* lists[] = {s.sa_list};
+  s.sa_queue->ExecuteCommandLists(1, lists);
+  s.sa_queue->Signal(s.sa_fence_out, v);
+  sa_submitted.store(v, std::memory_order_relaxed);
+  if (s.sa_fence_out->GetCompletedValue() >= v) return true;
+  s.sa_fence_out->SetEventOnCompletion(v, s.sa_event);
+  return WaitForSingleObject(s.sa_event, timeout_ms) == WAIT_OBJECT_0;
+}
+
 // The D3D11 transport's variant: the list waits on a fence the D3D11 context signals once its
 // copies are in, and signals the same fence when the result is ready for it to copy back.
 // Returns false if nothing was recorded this frame, so the caller must not wait.

@@ -65,6 +65,21 @@ with open('$hdr', 'w') as f:
   fi
 done
 
+# Vulkan transport shaders: HLSL -> SPIR-V, embedded the same way.
+for sh in nr_vk_depth; do
+  hlsl="$SHADER_SRC/$sh.hlsl"
+  hdr="$SHADER_OUT/${sh}_spv.h"
+  if [[ ! -f "$hdr" || "$hlsl" -nt "$hdr" ]]; then
+    echo "compiling shader: $sh (SPIR-V)"
+    "$DXC" -spirv -T cs_6_0 -E main -O3 -Fo "$SHADER_OUT/${sh}_spv" "$hlsl"
+    python3 -c "
+data = open('$SHADER_OUT/${sh}_spv', 'rb').read()
+with open('$hdr', 'w') as f:
+    f.write('unsigned char ${sh}_spv[] = {' + ','.join(str(b) for b in data) + '};\n')
+"
+  fi
+done
+
 # Detours (from the RenoDX submodule), compiled once and cached.
 DETOURS_OBJ="$OUT/detours-obj"
 mkdir -p "$DETOURS_OBJ"

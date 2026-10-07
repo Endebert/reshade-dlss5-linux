@@ -22,6 +22,7 @@
 
 #include "ngx_probe.hpp"
 #include "nr_d3d11.hpp"
+#include "nr_vulkan.hpp"
 
 namespace {
 
@@ -178,6 +179,34 @@ void OnRenderTechniqueD3D11(reshade::api::effect_runtime* runtime,
       PreprocessorFloat(runtime, "RESHADE_DEPTH_INPUT_Y_SCALE"));
 }
 
+// Vulkan: the same inputs as ReShade API handles; the transport imports shared images itself.
+void OnRenderTechniqueVulkan(reshade::api::effect_runtime* runtime,
+                             reshade::api::command_list* cmd_list,
+                             reshade::api::resource_view rtv, const char* effect) {
+  auto* dev = runtime->get_device();
+  auto view = [&](const char* name) {
+    reshade::api::resource_view srv = {}, srv_srgb = {};
+    const auto var = runtime->find_texture_variable(effect, name);
+    if (var.handle != 0) runtime->get_texture_binding(var, &srv, &srv_srgb);
+    return srv;
+  };
+  const reshade::api::resource_view motion_srv = view(kMotionName);
+  reshade::api::resource_view depth_srv = {};
+  for (const char* depth_name : kDepthNames) {
+    depth_srv = view(depth_name);
+    if (depth_srv.handle != 0) break;
+  }
+  char reversed[8] = {};
+  const bool depth_inverted =
+      runtime->get_preprocessor_definition("RESHADE_DEPTH_INPUT_IS_REVERSED", reversed) &&
+      reversed[0] == '1';
+  nr_vulkan::OnFrame(runtime, cmd_list, dev->get_resource_from_view(rtv), depth_srv,
+                     motion_srv.handle != 0 ? dev->get_resource_from_view(motion_srv)
+                                            : reshade::api::resource{0},
+                     depth_inverted, PreprocessorFloat(runtime, "RESHADE_DEPTH_INPUT_X_SCALE"),
+                     PreprocessorFloat(runtime, "RESHADE_DEPTH_INPUT_Y_SCALE"));
+}
+
 void OnRenderTechnique(reshade::api::effect_runtime* runtime,
                        reshade::api::effect_technique technique,
                        reshade::api::command_list* cmd_list, reshade::api::resource_view rtv,
@@ -191,6 +220,10 @@ void OnRenderTechnique(reshade::api::effect_runtime* runtime,
   const auto api = runtime->get_device()->get_api();
   if (api == reshade::api::device_api::d3d11) {
     OnRenderTechniqueD3D11(runtime, cmd_list, rtv, effect);
+    return;
+  }
+  if (api == reshade::api::device_api::vulkan) {
+    OnRenderTechniqueVulkan(runtime, cmd_list, rtv, effect);
     return;
   }
   if (api != reshade::api::device_api::d3d12) return;
@@ -548,6 +581,7 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lp_reserved) {
       if (lp_reserved != nullptr) break;
       ngx_probe::Uninstall();
       nr_d3d11::Shutdown();
+      nr_vulkan::Shutdown(nullptr);  // the device's own objects die with it
       nr_runner::Shutdown();
       reshade::unregister_overlay("DLSSNR Linux", OnDrawOverlay);
       reshade::unregister_event<reshade::addon_event::reshade_render_technique>(OnRenderTechnique);
