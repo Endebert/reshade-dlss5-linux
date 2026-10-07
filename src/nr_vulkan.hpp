@@ -112,6 +112,7 @@ inline uint32_t VkFormatOf(DXGI_FORMAT f) {
 struct Shared {
   ID3D12Resource* tex12 = nullptr;
   VkH image = 0;
+  bool laid_out = false;  // moved to GENERAL once; it never leaves it
   VkH memory = 0;
   UINT w = 0, h = 0;
   DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
@@ -435,18 +436,22 @@ inline void OnFrame(reshade::api::effect_runtime* runtime, reshade::api::command
   cmd_list->barrier(motion, resource_usage::shader_resource, resource_usage::copy_source);
 
   VkCmd cb = reinterpret_cast<VkCmd>(cmd_list->get_native());
-  ImageBarrier(cb, v.color.image, kLayoutUndefined, kLayoutTransferDst);
-  ImageBarrier(cb, v.depth.image, kLayoutUndefined, kLayoutTransferDst);
-  ImageBarrier(cb, v.motion.image, kLayoutUndefined, kLayoutTransferDst);
-  CopyImage(cb, back_buffer.handle, kLayoutTransferSrc, v.color.image, kLayoutTransferDst,
-            v.color.w, v.color.h);
-  CopyImage(cb, v.depth32.handle, kLayoutTransferSrc, v.depth.image, kLayoutTransferDst,
-            v.depth.w, v.depth.h);
-  CopyImage(cb, motion.handle, kLayoutTransferSrc, v.motion.image, kLayoutTransferDst,
-            v.motion.w, v.motion.h);
-  ImageBarrier(cb, v.color.image, kLayoutTransferDst, kLayoutGeneral);
-  ImageBarrier(cb, v.depth.image, kLayoutTransferDst, kLayoutGeneral);
-  ImageBarrier(cb, v.motion.image, kLayoutTransferDst, kLayoutGeneral);
+  // The shared images live in GENERAL, as dlss5-bridge keeps them: a transition through the
+  // transfer layouts (and above all from UNDEFINED) lets the driver keep the data in a form the
+  // D3D12 side never sees -- it went on reading its own last write. Only the first use moves an
+  // image out of UNDEFINED; after that every barrier is GENERAL to GENERAL.
+  for (Shared* t : {&v.color, &v.depth, &v.motion}) {
+    ImageBarrier(cb, t->image, t->laid_out ? kLayoutGeneral : kLayoutUndefined, kLayoutGeneral);
+    t->laid_out = true;
+  }
+  CopyImage(cb, back_buffer.handle, kLayoutTransferSrc, v.color.image, kLayoutGeneral, v.color.w,
+            v.color.h);
+  CopyImage(cb, v.depth32.handle, kLayoutTransferSrc, v.depth.image, kLayoutGeneral, v.depth.w,
+            v.depth.h);
+  CopyImage(cb, motion.handle, kLayoutTransferSrc, v.motion.image, kLayoutGeneral, v.motion.w,
+            v.motion.h);
+  for (Shared* t : {&v.color, &v.depth, &v.motion})
+    ImageBarrier(cb, t->image, kLayoutGeneral, kLayoutGeneral);
   cmd_list->barrier(motion, resource_usage::copy_source, resource_usage::shader_resource);
 
   // The CPU orders the two APIs: the game's queue runs dry, then the pass runs and is waited on.
@@ -461,12 +466,12 @@ inline void OnFrame(reshade::api::effect_runtime* runtime, reshade::api::command
   // Out: the result back into the back buffer, on the freshly reset immediate list.
   cb = reinterpret_cast<VkCmd>(cmd_list->get_native());
   if (ran) {
-    ImageBarrier(cb, v.color.image, kLayoutGeneral, kLayoutTransferSrc);
+    ImageBarrier(cb, v.color.image, kLayoutGeneral, kLayoutGeneral);
     cmd_list->barrier(back_buffer, resource_usage::copy_source, resource_usage::copy_dest);
     cb = reinterpret_cast<VkCmd>(cmd_list->get_native());
-    CopyImage(cb, v.color.image, kLayoutTransferSrc, back_buffer.handle, kLayoutTransferDst,
+    CopyImage(cb, v.color.image, kLayoutGeneral, back_buffer.handle, kLayoutTransferDst,
               v.color.w, v.color.h);
-    ImageBarrier(cb, v.color.image, kLayoutTransferSrc, kLayoutGeneral);
+    ImageBarrier(cb, v.color.image, kLayoutGeneral, kLayoutGeneral);
     cmd_list->barrier(back_buffer, resource_usage::copy_dest, resource_usage::render_target);
   } else {
     cmd_list->barrier(back_buffer, resource_usage::copy_source, resource_usage::render_target);
