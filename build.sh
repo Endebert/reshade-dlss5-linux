@@ -66,12 +66,14 @@ with open('$hdr', 'w') as f:
 done
 
 # Vulkan transport shaders: HLSL -> SPIR-V, embedded the same way.
-for sh in nr_vk_depth; do
-  hlsl="$SHADER_SRC/$sh.hlsl"
+for variant in "nr_vk_depth:" "nr_vk_depth_flip:-D FLIP=1"; do
+  sh="${variant%%:*}"
+  defines="${variant#*:}"
+  hlsl="$SHADER_SRC/nr_vk_depth.hlsl"
   hdr="$SHADER_OUT/${sh}_spv.h"
   if [[ ! -f "$hdr" || "$hlsl" -nt "$hdr" ]]; then
     echo "compiling shader: $sh (SPIR-V)"
-    "$DXC" -spirv -T cs_6_0 -E main -O3 -Fo "$SHADER_OUT/${sh}_spv" "$hlsl"
+    "$DXC" -spirv -T cs_6_0 -E main -O3 $defines -Fo "$SHADER_OUT/${sh}_spv" "$hlsl"
     python3 -c "
 data = open('$SHADER_OUT/${sh}_spv', 'rb').read()
 with open('$hdr', 'w') as f:

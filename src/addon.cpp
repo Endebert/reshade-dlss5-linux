@@ -167,6 +167,10 @@ void OnRenderTechniqueD3D11(reshade::api::effect_runtime* runtime,
   const bool depth_inverted =
       runtime->get_preprocessor_definition("RESHADE_DEPTH_INPUT_IS_REVERSED", reversed) &&
       reversed[0] == '1';
+  char upside_down[8] = {};
+  const bool depth_upside_down =
+      runtime->get_preprocessor_definition("RESHADE_DEPTH_INPUT_IS_UPSIDE_DOWN", upside_down) &&
+      upside_down[0] == '1';
   nr_d3d11::OnFrame(
       reinterpret_cast<ID3D11Device*>(dev->get_native()),
       reinterpret_cast<ID3D11DeviceContext*>(cmd_list->get_native()),
@@ -175,7 +179,7 @@ void OnRenderTechniqueD3D11(reshade::api::effect_runtime* runtime,
       motion_srv.handle != 0
           ? reinterpret_cast<ID3D11Resource*>(dev->get_resource_from_view(motion_srv).handle)
           : nullptr,
-      depth_inverted, PreprocessorFloat(runtime, "RESHADE_DEPTH_INPUT_X_SCALE"),
+      depth_inverted, depth_upside_down, PreprocessorFloat(runtime, "RESHADE_DEPTH_INPUT_X_SCALE"),
       PreprocessorFloat(runtime, "RESHADE_DEPTH_INPUT_Y_SCALE"));
 }
 
@@ -200,10 +204,15 @@ void OnRenderTechniqueVulkan(reshade::api::effect_runtime* runtime,
   const bool depth_inverted =
       runtime->get_preprocessor_definition("RESHADE_DEPTH_INPUT_IS_REVERSED", reversed) &&
       reversed[0] == '1';
+  char upside_down[8] = {};
+  const bool depth_upside_down =
+      runtime->get_preprocessor_definition("RESHADE_DEPTH_INPUT_IS_UPSIDE_DOWN", upside_down) &&
+      upside_down[0] == '1';
   nr_vulkan::OnFrame(runtime, cmd_list, dev->get_resource_from_view(rtv), depth_srv,
                      motion_srv.handle != 0 ? dev->get_resource_from_view(motion_srv)
                                             : reshade::api::resource{0},
-                     depth_inverted, PreprocessorFloat(runtime, "RESHADE_DEPTH_INPUT_X_SCALE"),
+                     depth_inverted, depth_upside_down,
+                     PreprocessorFloat(runtime, "RESHADE_DEPTH_INPUT_X_SCALE"),
                      PreprocessorFloat(runtime, "RESHADE_DEPTH_INPUT_Y_SCALE"));
 }
 

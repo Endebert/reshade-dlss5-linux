@@ -8,9 +8,15 @@
 //
 // Following dlss5-bridge by NIGos (MIT), nothing in Vulkan is hooked: ReShade already enables
 // VK_KHR_external_memory_win32 on the devices it creates, which is all the import needs. The
-// few Vulkan declarations used are written out rather than vendored, as the bridge does. The two
-// APIs are ordered by the CPU for now: the game's queue is drained before the pass and the pass
-// waited on before the copy back.
+// few Vulkan declarations used are written out rather than vendored, as the bridge does.
+//
+// The two APIs are ordered by the bridge's park. Flushing ReShade's list mid-frame is not an
+// option: the flush that ends the frame is the one that waits on the game's present semaphores,
+// and a submit ahead of it copies the swapchain image before the game has finished drawing it --
+// a frame from three presents ago. So the copies in are recorded, a vkCmdSetEvent announces them,
+// and a vkCmdWaitEvents stalls the game's queue until a worker thread, having seen the first
+// event, has run the D3D12 pass and host-sets the second; the copy back is recorded after the
+// wait.
 
 #pragma once
 
@@ -27,6 +33,7 @@
 #include "nr_runner.hpp"
 
 #include "../build/shaders/nr_vk_depth_spv.h"
+#include "../build/shaders/nr_vk_depth_flip_spv.h"
 
 namespace nr_vulkan {
 
@@ -68,6 +75,10 @@ constexpr uint32_t kLayoutUndefined = 0, kLayoutGeneral = 1, kLayoutTransferSrc 
                    kLayoutTransferDst = 7;
 constexpr uint32_t kAccessRead = 0x8000, kAccessWrite = 0x10000, kStageAll = 0x10000;
 constexpr uint32_t kQueueFamilyIgnored = 0xFFFFFFFFu;
+constexpr uint32_t kStEventCreateInfo = 10, kStMemoryBarrier = 46;
+constexpr uint32_t kEventSet = 3, kStageHost = 0x4000;
+struct VkEventCreateInfo_ { uint32_t sType; const void* pNext; uint32_t flags; };
+struct VkMemoryBarrier_ { uint32_t sType; const void* pNext; uint32_t srcAccessMask, dstAccessMask; };
 
 using PFN_GetDeviceProcAddr = void*(__stdcall*)(VkDev, const char*);
 using PFN_CreateImage = int32_t(__stdcall*)(VkDev, const VkImageCreateInfo_*, const void*, VkH*);
@@ -79,6 +90,11 @@ using PFN_FreeMemory = void(__stdcall*)(VkDev, VkH, const void*);
 using PFN_BindImageMemory = int32_t(__stdcall*)(VkDev, VkH, VkH, uint64_t);
 using PFN_CmdPipelineBarrier = void(__stdcall*)(VkCmd, uint32_t, uint32_t, uint32_t, uint32_t, const void*, uint32_t, const void*, uint32_t, const VkImageMemoryBarrier_*);
 using PFN_CmdCopyImage = void(__stdcall*)(VkCmd, VkH, uint32_t, VkH, uint32_t, uint32_t, const VkImageCopy_*);
+using PFN_CreateEvent = int32_t(__stdcall*)(VkDev, const VkEventCreateInfo_*, const void*, VkH*);
+using PFN_DestroyEvent = void(__stdcall*)(VkDev, VkH, const void*);
+using PFN_EventHost = int32_t(__stdcall*)(VkDev, VkH);  // vkGetEventStatus, vkSetEvent, vkResetEvent
+using PFN_CmdSetEvent = void(__stdcall*)(VkCmd, VkH, uint32_t);
+using PFN_CmdWaitEvents = void(__stdcall*)(VkCmd, uint32_t, const VkH*, uint32_t, uint32_t, uint32_t, const VkMemoryBarrier_*, uint32_t, const void*, uint32_t, const void*);
 
 struct Vk {
   PFN_CreateImage CreateImage = nullptr;
@@ -90,6 +106,13 @@ struct Vk {
   PFN_BindImageMemory BindImageMemory = nullptr;
   PFN_CmdPipelineBarrier CmdPipelineBarrier = nullptr;
   PFN_CmdCopyImage CmdCopyImage = nullptr;
+  PFN_CreateEvent CreateEvent = nullptr;
+  PFN_DestroyEvent DestroyEvent = nullptr;
+  PFN_EventHost GetEventStatus = nullptr;
+  PFN_EventHost SetEvent = nullptr;
+  PFN_EventHost ResetEvent = nullptr;
+  PFN_CmdSetEvent CmdSetEvent = nullptr;
+  PFN_CmdWaitEvents CmdWaitEvents = nullptr;
 };
 
 // DXGI -> VkFormat for the formats that cross.
@@ -126,10 +149,17 @@ struct State {
   Shared color, depth, motion;
   // Depth conversion, on ReShade's API: a compute pipeline and an R32_FLOAT texture it writes.
   reshade::api::pipeline_layout layout = {0};
-  reshade::api::pipeline pipeline = {0};
+  reshade::api::pipeline pipeline = {0}, pipeline_flip = {0};
   reshade::api::resource depth32 = {0};
   reshade::api::resource_view depth32_uav = {0};
   UINT depth32_w = 0, depth32_h = 0;
+  // The park: two event pairs used in turn, and the worker that serves them.
+  VkH ev_in[2] = {}, ev_out[2] = {};
+  HANDLE worker = nullptr, wake = nullptr, done = nullptr;
+  LONG stop = 0;
+  int pair = 0;           // the pair the worker serves next
+  bool armed = false;     // a frame was handed to the worker and not yet collected
+  LONG missed = 0;  // the worker never saw the copies of the last frame
 };
 
 inline State v;
@@ -160,10 +190,19 @@ inline bool LoadVk(VkDev device) {
   f.BindImageMemory = (PFN_BindImageMemory)gdpa(device, "vkBindImageMemory");
   f.CmdPipelineBarrier = (PFN_CmdPipelineBarrier)gdpa(device, "vkCmdPipelineBarrier");
   f.CmdCopyImage = (PFN_CmdCopyImage)gdpa(device, "vkCmdCopyImage");
+  f.CreateEvent = (PFN_CreateEvent)gdpa(device, "vkCreateEvent");
+  f.DestroyEvent = (PFN_DestroyEvent)gdpa(device, "vkDestroyEvent");
+  f.GetEventStatus = (PFN_EventHost)gdpa(device, "vkGetEventStatus");
+  f.SetEvent = (PFN_EventHost)gdpa(device, "vkSetEvent");
+  f.ResetEvent = (PFN_EventHost)gdpa(device, "vkResetEvent");
+  f.CmdSetEvent = (PFN_CmdSetEvent)gdpa(device, "vkCmdSetEvent");
+  f.CmdWaitEvents = (PFN_CmdWaitEvents)gdpa(device, "vkCmdWaitEvents");
   if (f.GetMemoryWin32HandleProperties == nullptr)
     return Fail("VK_KHR_external_memory_win32 is not enabled on the game's device");
   if (!f.CreateImage || !f.DestroyImage || !f.GetImageMemoryRequirements || !f.AllocateMemory ||
-      !f.FreeMemory || !f.BindImageMemory || !f.CmdPipelineBarrier || !f.CmdCopyImage)
+      !f.FreeMemory || !f.BindImageMemory || !f.CmdPipelineBarrier || !f.CmdCopyImage ||
+      !f.CreateEvent || !f.DestroyEvent || !f.GetEventStatus || !f.SetEvent || !f.ResetEvent ||
+      !f.CmdSetEvent || !f.CmdWaitEvents)
     return Fail("a Vulkan entry point did not resolve");
   v.device = device;
   return true;
@@ -203,7 +242,7 @@ inline bool EnsureD3D12() {
   HRESULT hr = E_FAIL;
   for (D3D_FEATURE_LEVEL level :
        {D3D_FEATURE_LEVEL_12_1, D3D_FEATURE_LEVEL_12_0, D3D_FEATURE_LEVEL_11_0}) {
-    hr = create(chosen, level, IID_PPV_ARGS(&v.dev12));
+    hr = create(nullptr, level, IID_PPV_ARGS(&v.dev12));  // the default adapter, as dlss5-bridge
     if (SUCCEEDED(hr)) {
       ngx_probe::Logf("nr-vulkan: private D3D12 device at feature level 0x%x%s", (unsigned)level,
                       chosen != nullptr ? " on the NVIDIA adapter" : " on the default adapter");
@@ -235,6 +274,10 @@ inline bool EnsureDepthPipeline(reshade::api::device* dev) {
   cs.entry_point = "main";
   pipeline_subobject sub = {pipeline_subobject_type::compute_shader, 1, &cs};
   if (!dev->create_pipeline(v.layout, 1, &sub, &v.pipeline))
+    return Fail("depth conversion pipeline failed");
+  cs.code = nr_vk_depth_flip_spv;
+  cs.code_size = sizeof(nr_vk_depth_flip_spv);
+  if (!dev->create_pipeline(v.layout, 1, &sub, &v.pipeline_flip))
     return Fail("depth conversion pipeline failed");
   return true;
 }
@@ -369,6 +412,87 @@ inline void CopyImage(VkCmd cb, VkH src, uint32_t src_layout, VkH dst, uint32_t 
   v.vk.CmdCopyImage(cb, src, src_layout, dst, dst_layout, 1, &region);
 }
 
+// --- the park -------------------------------------------------------------------
+
+// Polls without burning a core: yields for the first millisecond, then sleeps.
+inline bool PollEvent(VkH event, DWORD timeout_ms) {
+  const ULONGLONG t0 = GetTickCount64();
+  for (;;) {
+    if (v.vk.GetEventStatus(v.device, event) == (int32_t)kEventSet) return true;
+    const ULONGLONG waited = GetTickCount64() - t0;
+    if (waited > timeout_ms) return false;
+    if (waited == 0) SwitchToThread(); else Sleep(1);
+  }
+}
+
+// Waits for the copies of the armed frame to execute, runs the D3D12 pass and releases the
+// game's queue. Releasing is unconditional: a parked queue whose event is never set is a lost
+// device.
+inline DWORD WINAPI ParkWorker(LPVOID) {
+  for (;;) {
+    WaitForSingleObject(v.wake, INFINITE);
+    if (v.stop != 0) break;
+    const int p = v.pair;
+    if (PollEvent(v.ev_in[p], 2000))
+      nr_runner::SubmitStandaloneAndWait(1500);
+    else
+      InterlockedExchange(&v.missed, 1);
+    v.vk.SetEvent(v.device, v.ev_out[p]);
+    SetEvent(v.done);
+  }
+  return 0;
+}
+
+inline bool EnsurePark() {
+  if (v.worker != nullptr) return true;
+  const VkEventCreateInfo_ ci = {kStEventCreateInfo, nullptr, 0};
+  for (int i = 0; i < 2; ++i)
+    if (v.vk.CreateEvent(v.device, &ci, nullptr, &v.ev_in[i]) != 0 ||
+        v.vk.CreateEvent(v.device, &ci, nullptr, &v.ev_out[i]) != 0)
+      return Fail("vkCreateEvent failed");
+  v.wake = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+  v.done = CreateEventW(nullptr, TRUE, TRUE, nullptr);
+  if (v.wake == nullptr || v.done == nullptr) return Fail("CreateEvent failed");
+  v.worker = CreateThread(nullptr, 0, ParkWorker, nullptr, 0, nullptr);
+  if (v.worker == nullptr) return Fail("the park's worker thread did not start");
+  return true;
+}
+
+// Collects the frame handed to the worker last. False if the transport has to stop.
+inline bool CollectPark() {
+  if (!v.armed) return true;
+  if (WaitForSingleObject(v.done, 3000) != WAIT_OBJECT_0) {
+    for (int i = 0; i < 2; ++i) v.vk.SetEvent(v.device, v.ev_out[i]);
+    return Fail("the D3D12 pass did not finish within 3 s");
+  }
+  v.armed = false;
+  if (InterlockedExchange(&v.missed, 0) != 0)
+    return Fail("the game's queue never reached the copies (the frame was not submitted)");
+  v.pair ^= 1;
+  return true;
+}
+
+inline void StopPark() {
+  if (v.worker != nullptr) {
+    InterlockedExchange(&v.stop, 1);
+    SetEvent(v.wake);
+    WaitForSingleObject(v.worker, 5000);
+    CloseHandle(v.worker);
+  }
+  for (int i = 0; i < 2; ++i) {
+    if (v.device != nullptr && v.vk.SetEvent != nullptr) {
+      if (v.ev_out[i] != 0) v.vk.SetEvent(v.device, v.ev_out[i]);
+    }
+  }
+  if (v.device != nullptr && v.vk.DestroyEvent != nullptr)
+    for (int i = 0; i < 2; ++i) {
+      if (v.ev_in[i] != 0) v.vk.DestroyEvent(v.device, v.ev_in[i], nullptr);
+      if (v.ev_out[i] != 0) v.vk.DestroyEvent(v.device, v.ev_out[i], nullptr);
+    }
+  if (v.wake != nullptr) CloseHandle(v.wake);
+  if (v.done != nullptr) CloseHandle(v.done);
+}
+
 inline DXGI_FORMAT ColorFormat(DXGI_FORMAT f) {
   switch (f) {
     case DXGI_FORMAT_R8G8B8A8_TYPELESS:
@@ -387,8 +511,8 @@ inline DXGI_FORMAT ColorFormat(DXGI_FORMAT f) {
 // depth and motion views are shader resources (ReShade's states).
 inline void OnFrame(reshade::api::effect_runtime* runtime, reshade::api::command_list* cmd_list,
                     reshade::api::resource back_buffer, reshade::api::resource_view depth_srv,
-                    reshade::api::resource motion, bool depth_inverted, float scale_x,
-                    float scale_y) {
+                    reshade::api::resource motion, bool depth_inverted, bool depth_upside_down,
+                    float scale_x, float scale_y) {
   using namespace reshade::api;
   if (v.failed || back_buffer.handle == 0) return;
   if (!nr_runner::StandaloneAllowed()) return;
@@ -400,7 +524,9 @@ inline void OnFrame(reshade::api::effect_runtime* runtime, reshade::api::command
   }
   device* dev = runtime->get_device();
   if (v.device == nullptr && !LoadVk(reinterpret_cast<VkDev>(dev->get_native()))) return;
-  if (!EnsureD3D12() || !EnsureDepthPipeline(dev)) return;
+  if (!EnsureD3D12() || !EnsureDepthPipeline(dev) || !EnsurePark()) return;
+  // The previous frame's pass has to be done before this one is recorded on the same list.
+  if (!CollectPark()) return;
 
   const resource_desc bd = dev->get_resource_desc(back_buffer);
   const resource_desc md = dev->get_resource_desc(motion);
@@ -413,15 +539,22 @@ inline void OnFrame(reshade::api::effect_runtime* runtime, reshade::api::command
   const DXGI_FORMAT color_format = ColorFormat(static_cast<DXGI_FORMAT>(bd.texture.format));
   DXGI_FORMAT motion_format = static_cast<DXGI_FORMAT>(md.texture.format);
   if (motion_format == DXGI_FORMAT_R16G16_TYPELESS) motion_format = DXGI_FORMAT_R16G16_FLOAT;
+  // A resize replaces the shared images; the queue must be done with the old ones first.
+  if (v.color.tex12 != nullptr &&
+      (v.color.w != bd.texture.width || v.color.h != bd.texture.height ||
+       v.depth.w != bd.texture.width || v.depth.h != bd.texture.height ||
+       v.motion.w != md.texture.width || v.motion.h != md.texture.height))
+    runtime->get_command_queue()->wait_idle();
   if (!EnsureShared(v.color, bd.texture.width, bd.texture.height, color_format, "colour") ||
       !EnsureShared(v.motion, md.texture.width, md.texture.height, motion_format, "motion") ||
-      !EnsureShared(v.depth, dd.texture.width, dd.texture.height, DXGI_FORMAT_R32_FLOAT, "depth") ||
-      !EnsureDepth32(dev, dd.texture.width, dd.texture.height))
+      !EnsureShared(v.depth, bd.texture.width, bd.texture.height, DXGI_FORMAT_R32_FLOAT, "depth") ||
+      !EnsureDepth32(dev, bd.texture.width, bd.texture.height))
     return;
 
   // In: depth converted on ReShade's API, then the three copies into the shared images.
   cmd_list->barrier(v.depth32, resource_usage::copy_source, resource_usage::unordered_access);
-  cmd_list->bind_pipeline(pipeline_stage::all_compute, v.pipeline);
+  cmd_list->bind_pipeline(pipeline_stage::all_compute,
+                          depth_upside_down ? v.pipeline_flip : v.pipeline);
   cmd_list->push_descriptors(shader_stage::compute, v.layout, 0,
                              descriptor_table_update{{}, 0, 0, 1,
                                                      descriptor_type::texture_shader_resource_view,
@@ -430,16 +563,14 @@ inline void OnFrame(reshade::api::effect_runtime* runtime, reshade::api::command
                              descriptor_table_update{{}, 0, 0, 1,
                                                      descriptor_type::texture_unordered_access_view,
                                                      &v.depth32_uav});
-  cmd_list->dispatch((dd.texture.width + 7) / 8, (dd.texture.height + 7) / 8, 1);
+  cmd_list->dispatch((bd.texture.width + 7) / 8, (bd.texture.height + 7) / 8, 1);
   cmd_list->barrier(v.depth32, resource_usage::unordered_access, resource_usage::copy_source);
   cmd_list->barrier(back_buffer, resource_usage::render_target, resource_usage::copy_source);
   cmd_list->barrier(motion, resource_usage::shader_resource, resource_usage::copy_source);
 
   VkCmd cb = reinterpret_cast<VkCmd>(cmd_list->get_native());
-  // The shared images live in GENERAL, as dlss5-bridge keeps them: a transition through the
-  // transfer layouts (and above all from UNDEFINED) lets the driver keep the data in a form the
-  // D3D12 side never sees -- it went on reading its own last write. Only the first use moves an
-  // image out of UNDEFINED; after that every barrier is GENERAL to GENERAL.
+  // The shared images live in GENERAL, as dlss5-bridge keeps them; the GENERAL to GENERAL barrier
+  // every frame is the memory dependency against what the D3D12 side wrote.
   for (Shared* t : {&v.color, &v.depth, &v.motion}) {
     ImageBarrier(cb, t->image, t->laid_out ? kLayoutGeneral : kLayoutUndefined, kLayoutGeneral);
     t->laid_out = true;
@@ -450,35 +581,40 @@ inline void OnFrame(reshade::api::effect_runtime* runtime, reshade::api::command
             v.depth.h);
   CopyImage(cb, motion.handle, kLayoutTransferSrc, v.motion.image, kLayoutGeneral, v.motion.w,
             v.motion.h);
-  for (Shared* t : {&v.color, &v.depth, &v.motion})
-    ImageBarrier(cb, t->image, kLayoutGeneral, kLayoutGeneral);
   cmd_list->barrier(motion, resource_usage::copy_source, resource_usage::shader_resource);
 
-  // The CPU orders the two APIs: the game's queue runs dry, then the pass runs and is waited on.
-  command_queue* queue = runtime->get_command_queue();
-  queue->flush_immediate_command_list();
-  queue->wait_idle();
-  bool ran = false;
-  if (nr_runner::OnStandaloneFrame(v.color.tex12, v.depth.tex12, v.motion.tex12, depth_inverted,
-                                   scale_x, scale_y, D3D12_RESOURCE_STATE_COMMON))
-    ran = nr_runner::SubmitStandaloneAndWait(3000);
-
-  // Out: the result back into the back buffer, on the freshly reset immediate list.
-  cb = reinterpret_cast<VkCmd>(cmd_list->get_native());
-  if (ran) {
-    ImageBarrier(cb, v.color.image, kLayoutGeneral, kLayoutGeneral);
-    cmd_list->barrier(back_buffer, resource_usage::copy_source, resource_usage::copy_dest);
-    cb = reinterpret_cast<VkCmd>(cmd_list->get_native());
-    CopyImage(cb, v.color.image, kLayoutGeneral, back_buffer.handle, kLayoutTransferDst,
-              v.color.w, v.color.h);
-    ImageBarrier(cb, v.color.image, kLayoutGeneral, kLayoutGeneral);
-    cmd_list->barrier(back_buffer, resource_usage::copy_dest, resource_usage::render_target);
-  } else {
+  // The D3D12 pass is recorded now and submitted by the worker once the copies have executed.
+  const bool recorded =
+      nr_runner::OnStandaloneFrame(v.color.tex12, v.depth.tex12, v.motion.tex12, depth_inverted,
+                                   scale_x, scale_y, D3D12_RESOURCE_STATE_COMMON);
+  if (!recorded) {
     cmd_list->barrier(back_buffer, resource_usage::copy_source, resource_usage::render_target);
+    return;
   }
+
+  // Park: announce the copies, stall the queue until the worker releases it, copy the result
+  // back. The pair was used two frames ago; the worker has since seen the other pair's first
+  // event, which the queue reached only after passing this pair's wait, so resetting is safe.
+  const int p = v.pair;
+  v.vk.ResetEvent(v.device, v.ev_in[p]);
+  v.vk.ResetEvent(v.device, v.ev_out[p]);
+  v.vk.CmdSetEvent(cb, v.ev_in[p], kStageAll);
+  const VkMemoryBarrier_ mb = {kStMemoryBarrier, nullptr, kAccessRead | kAccessWrite,
+                               kAccessRead | kAccessWrite};
+  v.vk.CmdWaitEvents(cb, 1, &v.ev_out[p], kStageHost | kStageAll, kStageAll, 1, &mb, 0, nullptr,
+                     0, nullptr);
+  ImageBarrier(cb, v.color.image, kLayoutGeneral, kLayoutGeneral);
+  cmd_list->barrier(back_buffer, resource_usage::copy_source, resource_usage::copy_dest);
+  CopyImage(cb, v.color.image, kLayoutGeneral, back_buffer.handle, kLayoutTransferDst, v.color.w,
+            v.color.h);
+  cmd_list->barrier(back_buffer, resource_usage::copy_dest, resource_usage::render_target);
+  ResetEvent(v.done);
+  v.armed = true;
+  SetEvent(v.wake);
 }
 
 inline void Shutdown(reshade::api::device* dev) {
+  StopPark();
   Release(v.color);
   Release(v.depth);
   Release(v.motion);
@@ -486,6 +622,7 @@ inline void Shutdown(reshade::api::device* dev) {
     if (v.depth32_uav.handle != 0) dev->destroy_resource_view(v.depth32_uav);
     if (v.depth32.handle != 0) dev->destroy_resource(v.depth32);
     if (v.pipeline.handle != 0) dev->destroy_pipeline(v.pipeline);
+    if (v.pipeline_flip.handle != 0) dev->destroy_pipeline(v.pipeline_flip);
     if (v.layout.handle != 0) dev->destroy_pipeline_layout(v.layout);
   }
   if (v.dev12 != nullptr) v.dev12->Release();

@@ -43,6 +43,7 @@ struct State {
   Shared color, depth, motion;
   ID3D11UnorderedAccessView* depth_uav = nullptr;
   ID3D11ComputeShader* depth_cs = nullptr;
+  ID3D11ComputeShader* depth_cs_flip = nullptr;  // RESHADE_DEPTH_INPUT_IS_UPSIDE_DOWN
 };
 
 inline State d;
@@ -65,9 +66,13 @@ constexpr char kDepthCs[] =
     "RWTexture2D<float> dst : register(u0);\n"
     "[numthreads(8, 8, 1)]\n"
     "void main(uint3 id : SV_DispatchThreadID) {\n"
-    "  uint w, h; dst.GetDimensions(w, h);\n"
+    "  uint w, h, sw, sh; dst.GetDimensions(w, h); src.GetDimensions(sw, sh);\n"
     "  if (id.x >= w || id.y >= h) return;\n"
-    "  dst[id.xy] = src.Load(int3(id.xy, 0));\n"
+    "  uint2 s = uint2(id.x * sw / w, id.y * sh / h);\n"
+    "#if FLIP\n"
+    "  s.y = sh - 1 - s.y;\n"
+    "#endif\n"
+    "  dst[id.xy] = src.Load(int3(s, 0));\n"
     "}\n";
 
 // Called by the runner's watchdog when the D3D12 side stopped: the D3D11 context waits on this
@@ -128,16 +133,20 @@ inline bool EnsureDevice(ID3D11Device* dev11, ID3D11DeviceContext* ctx) {
   auto compile = compiler != nullptr ? (PFN_D3DCompile_)GetProcAddress(compiler, "D3DCompile")
                                      : nullptr;
   if (compile == nullptr) return Fail("d3dcompiler_47.dll unavailable");
-  ID3DBlob* code = nullptr;
-  ID3DBlob* errors = nullptr;
-  hr = compile(kDepthCs, sizeof(kDepthCs) - 1, "nr_depth", nullptr, nullptr, "main", "cs_5_0", 0, 0,
-               &code, &errors);
-  if (errors != nullptr) errors->Release();
-  if (FAILED(hr)) return Fail("depth conversion shader failed to compile", hr);
-  hr = dev11->CreateComputeShader(code->GetBufferPointer(), code->GetBufferSize(), nullptr,
-                                  &d.depth_cs);
-  code->Release();
-  if (FAILED(hr)) return Fail("CreateComputeShader failed", hr);
+  for (ID3D11ComputeShader** target : {&d.depth_cs, &d.depth_cs_flip}) {
+    const D3D_SHADER_MACRO defines[] = {{"FLIP", target == &d.depth_cs_flip ? "1" : "0"},
+                                        {nullptr, nullptr}};
+    ID3DBlob* code = nullptr;
+    ID3DBlob* errors = nullptr;
+    hr = compile(kDepthCs, sizeof(kDepthCs) - 1, "nr_depth", defines, nullptr, "main", "cs_5_0",
+                 0, 0, &code, &errors);
+    if (errors != nullptr) errors->Release();
+    if (FAILED(hr)) return Fail("depth conversion shader failed to compile", hr);
+    hr = dev11->CreateComputeShader(code->GetBufferPointer(), code->GetBufferSize(), nullptr,
+                                    target);
+    code->Release();
+    if (FAILED(hr)) return Fail("CreateComputeShader failed", hr);
+  }
 
   ngx_probe::Log("nr-d3d11: transport ready (shared fence, depth conversion)");
   return true;
@@ -255,7 +264,8 @@ inline DXGI_FORMAT MotionFormat(DXGI_FORMAT f) {
 // context. depth_srv is ReShade's depth binding; motion is the motion-vector texture.
 inline void OnFrame(ID3D11Device* dev11, ID3D11DeviceContext* ctx, ID3D11Resource* back_buffer,
                     ID3D11ShaderResourceView* depth_srv, ID3D11Resource* motion,
-                    bool depth_inverted, float scale_x, float scale_y) {
+                    bool depth_inverted, bool depth_upside_down, float scale_x,
+                    float scale_y) {
   if (d.failed || back_buffer == nullptr) return;
   if (!nr_runner::StandaloneAllowed()) return;
   if (depth_srv == nullptr || motion == nullptr) {
@@ -296,7 +306,7 @@ inline void OnFrame(ID3D11Device* dev11, ID3D11DeviceContext* ctx, ID3D11Resourc
 
   if (!EnsureShared(d.color, bd.Width, bd.Height, ColorFormat(bd.Format), false, "colour") ||
       !EnsureShared(d.motion, md.Width, md.Height, MotionFormat(md.Format), false, "motion") ||
-      !EnsureShared(d.depth, dd.Width, dd.Height, DXGI_FORMAT_R32_FLOAT, true, "depth")) {
+      !EnsureShared(d.depth, bd.Width, bd.Height, DXGI_FORMAT_R32_FLOAT, true, "depth")) {
     release();
     return;
   }
@@ -310,10 +320,10 @@ inline void OnFrame(ID3D11Device* dev11, ID3D11DeviceContext* ctx, ID3D11Resourc
   // D3D11 side in: colour and motion copied, depth converted.
   ctx->CopyResource(d.color.tex11, bb_tex);
   ctx->CopyResource(d.motion.tex11, mv_tex);
-  ctx->CSSetShader(d.depth_cs, nullptr, 0);
+  ctx->CSSetShader(depth_upside_down ? d.depth_cs_flip : d.depth_cs, nullptr, 0);
   ctx->CSSetShaderResources(0, 1, &depth_srv);
   ctx->CSSetUnorderedAccessViews(0, 1, &d.depth_uav, nullptr);
-  ctx->Dispatch((dd.Width + 7) / 8, (dd.Height + 7) / 8, 1);
+  ctx->Dispatch((bd.Width + 7) / 8, (bd.Height + 7) / 8, 1);
   ID3D11ShaderResourceView* no_srv = nullptr;
   ID3D11UnorderedAccessView* no_uav = nullptr;
   ctx->CSSetShaderResources(0, 1, &no_srv);
@@ -339,6 +349,7 @@ inline void OnFrame(ID3D11Device* dev11, ID3D11DeviceContext* ctx, ID3D11Resourc
 inline void Shutdown() {
   if (d.depth_uav != nullptr) d.depth_uav->Release();
   if (d.depth_cs != nullptr) d.depth_cs->Release();
+  if (d.depth_cs_flip != nullptr) d.depth_cs_flip->Release();
   Release(d.color);
   Release(d.depth);
   Release(d.motion);
