@@ -361,9 +361,14 @@ inline bool EnsureShared(Shared& t, UINT w, UINT h, DXGI_FORMAT format, const ch
     f.GetImageMemoryRequirements(v.device, t.image, &req);
     r = f.GetMemoryWin32HandleProperties(v.device, kHandleD3D12Resource, handle, &props);
   }
+  // The types the handle allows and the ones the resource allows; if they share none (as the
+  // driver answers for some imports), the resource's own set is what the allocation can use.
   uint32_t bits = req.memoryTypeBits & (props.memoryTypeBits != 0 ? props.memoryTypeBits : ~0u);
+  if (bits == 0) bits = req.memoryTypeBits;
   uint32_t type = 0;
   while (type < 32 && (bits & (1u << type)) == 0) ++type;
+  ngx_probe::Logf("nr-vulkan: %s memory: resource allows 0x%x, handle allows 0x%x, using type %u",
+                  name, req.memoryTypeBits, props.memoryTypeBits, type);
   if (r == 0 && type < 32) {
     VkMemoryDedicatedAllocateInfo_ dedicated = {kStMemoryDedicated, nullptr, t.image, 0};
     VkImportMemoryWin32HandleInfo_ import = {kStImportMemoryWin32, &dedicated, kHandleD3D12Resource,
@@ -446,9 +451,14 @@ inline bool EnsureSharedBuf(SharedBuf& t, UINT w, UINT h, DXGI_FORMAT format, UI
     f.GetBufferMemoryRequirements(v.device, t.buffer, &req);
     r = f.GetMemoryWin32HandleProperties(v.device, kHandleD3D12Resource, handle, &props);
   }
+  // The types the handle allows and the ones the resource allows; if they share none (as the
+  // driver answers for some imports), the resource's own set is what the allocation can use.
   uint32_t bits = req.memoryTypeBits & (props.memoryTypeBits != 0 ? props.memoryTypeBits : ~0u);
+  if (bits == 0) bits = req.memoryTypeBits;
   uint32_t type = 0;
   while (type < 32 && (bits & (1u << type)) == 0) ++type;
+  ngx_probe::Logf("nr-vulkan: %s memory: resource allows 0x%x, handle allows 0x%x, using type %u",
+                  name, req.memoryTypeBits, props.memoryTypeBits, type);
   if (r == 0 && type < 32) {
     VkMemoryDedicatedAllocateInfo_ dedicated = {kStMemoryDedicated, nullptr, 0, t.buffer};
     VkImportMemoryWin32HandleInfo_ import = {kStImportMemoryWin32, &dedicated, kHandleD3D12Resource,
