@@ -151,7 +151,7 @@ struct SharedBuf {
 
 struct State {
   bool failed = false;
-  SharedBuf depth_buf, motion_buf;
+  SharedBuf depth_buf, motion_buf, color_buf;  // color_buf carries the frame in; color, out
   ID3D12CommandQueue* unpack_queue = nullptr;
   ID3D12CommandAllocator* unpack_alloc = nullptr;
   ID3D12GraphicsCommandList* unpack_list = nullptr;
@@ -522,6 +522,20 @@ inline bool Unpack() {
     v.unpack_list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
     BarrierD3D12(v.unpack_list, t->tex12, D3D12_RESOURCE_STATE_COPY_DEST, kReadable);
   }
+  // The frame itself goes straight into the shared texture the pass reads and writes in place.
+  BarrierD3D12(v.unpack_list, v.color.tex12, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
+  {
+    D3D12_TEXTURE_COPY_LOCATION dst = {};
+    dst.pResource = v.color.tex12;
+    dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    D3D12_TEXTURE_COPY_LOCATION src = {};
+    src.pResource = v.color_buf.buf12;
+    src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    src.PlacedFootprint.Footprint = {v.color_buf.format, v.color_buf.w, v.color_buf.h, 1,
+                                     v.color_buf.pitch};
+    v.unpack_list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+  }
+  BarrierD3D12(v.unpack_list, v.color.tex12, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
   if (FAILED(v.unpack_list->Close())) return Fail("D3D12 unpack list failed to close");
   ID3D12CommandList* lists[] = {v.unpack_list};
   v.unpack_queue->ExecuteCommandLists(1, lists);
@@ -617,6 +631,8 @@ inline void OnFrame(reshade::api::effect_runtime* runtime, reshade::api::command
                        motion_format == DXGI_FORMAT_R32G32_FLOAT ? 8 : 4, "motion") ||
       !EnsureSharedBuf(v.depth_buf, dd.texture.width, dd.texture.height, DXGI_FORMAT_R32_FLOAT, 4,
                        "depth") ||
+      !EnsureSharedBuf(v.color_buf, bd.texture.width, bd.texture.height, color_format,
+                       color_format == DXGI_FORMAT_R16G16B16A16_FLOAT ? 8 : 4, "colour") ||
       !EnsureUnpack() ||
       !EnsureDepth32(dev, dd.texture.width, dd.texture.height))
     return;
@@ -638,10 +654,7 @@ inline void OnFrame(reshade::api::effect_runtime* runtime, reshade::api::command
   cmd_list->barrier(motion, resource_usage::shader_resource, resource_usage::copy_source);
 
   VkCmd cb = reinterpret_cast<VkCmd>(cmd_list->get_native());
-  ImageBarrier(cb, v.color.image, kLayoutUndefined, kLayoutTransferDst);
-  CopyImage(cb, back_buffer.handle, kLayoutTransferSrc, v.color.image, kLayoutTransferDst,
-            v.color.w, v.color.h);
-  ImageBarrier(cb, v.color.image, kLayoutTransferDst, kLayoutGeneral);
+  CopyToBuffer(cb, back_buffer.handle, v.color_buf);
   CopyToBuffer(cb, v.depth32.handle, v.depth_buf);
   CopyToBuffer(cb, motion.handle, v.motion_buf);
   cmd_list->barrier(motion, resource_usage::copy_source, resource_usage::shader_resource);
@@ -677,6 +690,7 @@ inline void Shutdown(reshade::api::device* dev) {
   Release(v.motion);
   Release(v.depth_buf);
   Release(v.motion_buf);
+  Release(v.color_buf);
   if (v.unpack_list != nullptr) v.unpack_list->Release();
   if (v.unpack_alloc != nullptr) v.unpack_alloc->Release();
   if (v.unpack_queue != nullptr) v.unpack_queue->Release();
