@@ -55,6 +55,15 @@ struct VkImageMemoryBarrier_ {
   uint32_t sType; const void* pNext; uint32_t srcAccessMask, dstAccessMask, oldLayout, newLayout;
   uint32_t srcQueueFamilyIndex, dstQueueFamilyIndex; VkH image; VkSubresourceRange_ subresourceRange;
 };
+struct VkExternalMemoryBufferCreateInfo_ { uint32_t sType; const void* pNext; uint32_t handleTypes; };
+struct VkBufferCreateInfo_ {
+  uint32_t sType; const void* pNext; uint32_t flags; uint64_t size; uint32_t usage;
+  uint32_t sharingMode; uint32_t queueFamilyIndexCount; const uint32_t* pQueueFamilyIndices;
+};
+struct VkBufferImageCopy_ {
+  uint64_t bufferOffset; uint32_t bufferRowLength, bufferImageHeight;
+  VkSubresourceLayers_ imageSubresource; VkOffset3D_ imageOffset; VkExtent3D_ imageExtent;
+};
 struct VkImageCopy_ {
   VkSubresourceLayers_ srcSubresource; VkOffset3D_ srcOffset;
   VkSubresourceLayers_ dstSubresource; VkOffset3D_ dstOffset; VkExtent3D_ extent;
@@ -62,6 +71,7 @@ struct VkImageCopy_ {
 
 constexpr uint32_t kStImageCreateInfo = 14, kStMemoryAllocateInfo = 5, kStImageMemoryBarrier = 45;
 constexpr uint32_t kStExternalMemoryImage = 1000072001, kStImportMemoryWin32 = 1000073000;
+constexpr uint32_t kStExternalMemoryBuffer = 1000072000, kStBufferCreateInfo = 12;
 constexpr uint32_t kStMemoryWin32Props = 1000073002, kStMemoryDedicated = 1000127001;
 constexpr uint32_t kHandleD3D12Resource = 0x40;
 constexpr uint32_t kLayoutUndefined = 0, kLayoutGeneral = 1, kLayoutTransferSrc = 6,
@@ -79,6 +89,11 @@ using PFN_FreeMemory = void(__stdcall*)(VkDev, VkH, const void*);
 using PFN_BindImageMemory = int32_t(__stdcall*)(VkDev, VkH, VkH, uint64_t);
 using PFN_CmdPipelineBarrier = void(__stdcall*)(VkCmd, uint32_t, uint32_t, uint32_t, uint32_t, const void*, uint32_t, const void*, uint32_t, const VkImageMemoryBarrier_*);
 using PFN_CmdCopyImage = void(__stdcall*)(VkCmd, VkH, uint32_t, VkH, uint32_t, uint32_t, const VkImageCopy_*);
+using PFN_CreateBuffer = int32_t(__stdcall*)(VkDev, const VkBufferCreateInfo_*, const void*, VkH*);
+using PFN_DestroyBuffer = void(__stdcall*)(VkDev, VkH, const void*);
+using PFN_GetBufferMemoryRequirements = void(__stdcall*)(VkDev, VkH, VkMemoryRequirements_*);
+using PFN_BindBufferMemory = int32_t(__stdcall*)(VkDev, VkH, VkH, uint64_t);
+using PFN_CmdCopyImageToBuffer = void(__stdcall*)(VkCmd, VkH, uint32_t, VkH, uint32_t, const VkBufferImageCopy_*);
 
 struct Vk {
   PFN_CreateImage CreateImage = nullptr;
@@ -90,6 +105,11 @@ struct Vk {
   PFN_BindImageMemory BindImageMemory = nullptr;
   PFN_CmdPipelineBarrier CmdPipelineBarrier = nullptr;
   PFN_CmdCopyImage CmdCopyImage = nullptr;
+  PFN_CreateBuffer CreateBuffer = nullptr;
+  PFN_DestroyBuffer DestroyBuffer = nullptr;
+  PFN_GetBufferMemoryRequirements GetBufferMemoryRequirements = nullptr;
+  PFN_BindBufferMemory BindBufferMemory = nullptr;
+  PFN_CmdCopyImageToBuffer CmdCopyImageToBuffer = nullptr;
 };
 
 // DXGI -> VkFormat for the formats that cross.
@@ -117,8 +137,27 @@ struct Shared {
   DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
 };
 
+// Motion vectors and depth cross as plain buffers: a texture's memory layout can differ between
+// the game's Vulkan image and the D3D12 side's for some formats, a buffer's cannot. The D3D12 side
+// unpacks each into a texture of its own.
+struct SharedBuf {
+  ID3D12Resource* buf12 = nullptr;
+  ID3D12Resource* tex12 = nullptr;  // the unpacked texture the pass reads
+  VkH buffer = 0;
+  VkH memory = 0;
+  UINT w = 0, h = 0, pitch = 0, bpp = 0;
+  DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
+};
+
 struct State {
   bool failed = false;
+  SharedBuf depth_buf, motion_buf;
+  ID3D12CommandQueue* unpack_queue = nullptr;
+  ID3D12CommandAllocator* unpack_alloc = nullptr;
+  ID3D12GraphicsCommandList* unpack_list = nullptr;
+  ID3D12Fence* unpack_fence = nullptr;
+  UINT64 unpack_value = 0;
+  HANDLE unpack_event = nullptr;
   VkDev device = nullptr;
   Vk vk;
   ID3D12Device* dev12 = nullptr;
@@ -159,10 +198,17 @@ inline bool LoadVk(VkDev device) {
   f.BindImageMemory = (PFN_BindImageMemory)gdpa(device, "vkBindImageMemory");
   f.CmdPipelineBarrier = (PFN_CmdPipelineBarrier)gdpa(device, "vkCmdPipelineBarrier");
   f.CmdCopyImage = (PFN_CmdCopyImage)gdpa(device, "vkCmdCopyImage");
+  f.CreateBuffer = (PFN_CreateBuffer)gdpa(device, "vkCreateBuffer");
+  f.DestroyBuffer = (PFN_DestroyBuffer)gdpa(device, "vkDestroyBuffer");
+  f.GetBufferMemoryRequirements = (PFN_GetBufferMemoryRequirements)gdpa(device, "vkGetBufferMemoryRequirements");
+  f.BindBufferMemory = (PFN_BindBufferMemory)gdpa(device, "vkBindBufferMemory");
+  f.CmdCopyImageToBuffer = (PFN_CmdCopyImageToBuffer)gdpa(device, "vkCmdCopyImageToBuffer");
   if (f.GetMemoryWin32HandleProperties == nullptr)
     return Fail("VK_KHR_external_memory_win32 is not enabled on the game's device");
   if (!f.CreateImage || !f.DestroyImage || !f.GetImageMemoryRequirements || !f.AllocateMemory ||
-      !f.FreeMemory || !f.BindImageMemory || !f.CmdPipelineBarrier || !f.CmdCopyImage)
+      !f.FreeMemory || !f.BindImageMemory || !f.CmdPipelineBarrier || !f.CmdCopyImage ||
+      !f.CreateBuffer || !f.DestroyBuffer || !f.GetBufferMemoryRequirements || !f.BindBufferMemory ||
+      !f.CmdCopyImageToBuffer)
     return Fail("a Vulkan entry point did not resolve");
   v.device = device;
   return true;
@@ -343,6 +389,161 @@ inline bool EnsureShared(Shared& t, UINT w, UINT h, DXGI_FORMAT format, const ch
   return true;
 }
 
+inline void Release(SharedBuf& t) {
+  if (t.buffer != 0 && v.vk.DestroyBuffer != nullptr) v.vk.DestroyBuffer(v.device, t.buffer, nullptr);
+  if (t.memory != 0 && v.vk.FreeMemory != nullptr) v.vk.FreeMemory(v.device, t.memory, nullptr);
+  if (t.buf12 != nullptr) t.buf12->Release();
+  if (t.tex12 != nullptr) t.tex12->Release();
+  t = {};
+}
+
+inline bool EnsureSharedBuf(SharedBuf& t, UINT w, UINT h, DXGI_FORMAT format, UINT bpp,
+                            const char* name) {
+  if (t.buf12 != nullptr && t.w == w && t.h == h && t.format == format) return true;
+  Release(t);
+  const UINT pitch = (w * bpp + 255) & ~255u;  // D3D12 placed-footprint row alignment
+  const UINT64 size = (UINT64)pitch * h;
+  D3D12_HEAP_PROPERTIES heap = {};
+  heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+  D3D12_RESOURCE_DESC bd = {};
+  bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+  bd.Width = size;
+  bd.Height = 1;
+  bd.DepthOrArraySize = 1;
+  bd.MipLevels = 1;
+  bd.SampleDesc.Count = 1;
+  bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+  HANDLE handle = nullptr;
+  HRESULT hr = v.dev12->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_SHARED, &bd,
+                                                D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                IID_PPV_ARGS(&t.buf12));
+  if (SUCCEEDED(hr)) hr = v.dev12->CreateSharedHandle(t.buf12, nullptr, GENERIC_ALL, nullptr, &handle);
+  D3D12_RESOURCE_DESC td = {};
+  td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+  td.Width = w;
+  td.Height = h;
+  td.DepthOrArraySize = 1;
+  td.MipLevels = 1;
+  td.Format = format;
+  td.SampleDesc.Count = 1;
+  if (SUCCEEDED(hr))
+    hr = v.dev12->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &td,
+                                          D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                          IID_PPV_ARGS(&t.tex12));
+  if (FAILED(hr)) {
+    if (handle != nullptr) CloseHandle(handle);
+    Release(t);
+    return Fail("shared D3D12 buffer failed", hr);
+  }
+
+  const Vk& f = v.vk;
+  VkExternalMemoryBufferCreateInfo_ ext = {kStExternalMemoryBuffer, nullptr, kHandleD3D12Resource};
+  VkBufferCreateInfo_ ci = {kStBufferCreateInfo, &ext, 0, size, 1 | 2, 0, 0, nullptr};
+  int32_t r = f.CreateBuffer(v.device, &ci, nullptr, &t.buffer);
+  VkMemoryRequirements_ req = {};
+  VkMemoryWin32HandleProperties_ props = {kStMemoryWin32Props, nullptr, 0};
+  if (r == 0) {
+    f.GetBufferMemoryRequirements(v.device, t.buffer, &req);
+    r = f.GetMemoryWin32HandleProperties(v.device, kHandleD3D12Resource, handle, &props);
+  }
+  uint32_t bits = req.memoryTypeBits & (props.memoryTypeBits != 0 ? props.memoryTypeBits : ~0u);
+  uint32_t type = 0;
+  while (type < 32 && (bits & (1u << type)) == 0) ++type;
+  if (r == 0 && type < 32) {
+    VkMemoryDedicatedAllocateInfo_ dedicated = {kStMemoryDedicated, nullptr, 0, t.buffer};
+    VkImportMemoryWin32HandleInfo_ import = {kStImportMemoryWin32, &dedicated, kHandleD3D12Resource,
+                                             handle, nullptr};
+    VkMemoryAllocateInfo_ ai = {kStMemoryAllocateInfo, &import, req.size, type};
+    r = f.AllocateMemory(v.device, &ai, nullptr, &t.memory);
+    if (r == 0) r = f.BindBufferMemory(v.device, t.buffer, t.memory, 0);
+  } else if (r == 0) {
+    r = -1;
+  }
+  CloseHandle(handle);
+  if (r != 0) {
+    Release(t);
+    char why[96];
+    std::snprintf(why, sizeof(why), "importing the shared %s buffer into Vulkan failed", name);
+    return Fail(why, r);
+  }
+  t.w = w;
+  t.h = h;
+  t.pitch = pitch;
+  t.bpp = bpp;
+  t.format = format;
+  ngx_probe::Logf("nr-vulkan: shared %s buffer %ux%u format=%u pitch=%u imported", name, w, h,
+                  (unsigned)format, pitch);
+  return true;
+}
+
+inline bool EnsureUnpack() {
+  if (v.unpack_list != nullptr) return true;
+  D3D12_COMMAND_QUEUE_DESC qd = {};
+  qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+  bool ok = SUCCEEDED(v.dev12->CreateCommandQueue(&qd, IID_PPV_ARGS(&v.unpack_queue))) &&
+            SUCCEEDED(v.dev12->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                                      IID_PPV_ARGS(&v.unpack_alloc))) &&
+            SUCCEEDED(v.dev12->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, v.unpack_alloc,
+                                                 nullptr, IID_PPV_ARGS(&v.unpack_list))) &&
+            SUCCEEDED(v.unpack_list->Close()) &&
+            SUCCEEDED(v.dev12->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&v.unpack_fence)));
+  v.unpack_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+  if (!ok || v.unpack_event == nullptr) return Fail("D3D12 unpack queue setup failed");
+  return true;
+}
+
+inline void BarrierD3D12(ID3D12GraphicsCommandList* cmd, ID3D12Resource* r,
+                         D3D12_RESOURCE_STATES from, D3D12_RESOURCE_STATES to) {
+  D3D12_RESOURCE_BARRIER b = {};
+  b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+  b.Transition.pResource = r;
+  b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+  b.Transition.StateBefore = from;
+  b.Transition.StateAfter = to;
+  cmd->ResourceBarrier(1, &b);
+}
+
+constexpr D3D12_RESOURCE_STATES kReadable =
+    D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+
+// The buffers into their textures, waited on: the pass that follows reads them.
+inline bool Unpack() {
+  v.unpack_alloc->Reset();
+  v.unpack_list->Reset(v.unpack_alloc, nullptr);
+  for (SharedBuf* t : {&v.depth_buf, &v.motion_buf}) {
+    if (v.unpack_value > 0) BarrierD3D12(v.unpack_list, t->tex12, kReadable, D3D12_RESOURCE_STATE_COPY_DEST);
+    D3D12_TEXTURE_COPY_LOCATION dst = {};
+    dst.pResource = t->tex12;
+    dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    D3D12_TEXTURE_COPY_LOCATION src = {};
+    src.pResource = t->buf12;
+    src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    src.PlacedFootprint.Footprint = {t->format, t->w, t->h, 1, t->pitch};
+    v.unpack_list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+    BarrierD3D12(v.unpack_list, t->tex12, D3D12_RESOURCE_STATE_COPY_DEST, kReadable);
+  }
+  if (FAILED(v.unpack_list->Close())) return Fail("D3D12 unpack list failed to close");
+  ID3D12CommandList* lists[] = {v.unpack_list};
+  v.unpack_queue->ExecuteCommandLists(1, lists);
+  const UINT64 value = ++v.unpack_value;
+  v.unpack_queue->Signal(v.unpack_fence, value);
+  if (v.unpack_fence->GetCompletedValue() < value) {
+    v.unpack_fence->SetEventOnCompletion(value, v.unpack_event);
+    if (WaitForSingleObject(v.unpack_event, 3000) != WAIT_OBJECT_0)
+      return Fail("D3D12 unpack did not finish");
+  }
+  return true;
+}
+
+inline void CopyToBuffer(VkCmd cb, VkH image, const SharedBuf& t) {
+  VkBufferImageCopy_ region = {};
+  region.bufferRowLength = t.pitch / t.bpp;
+  region.bufferImageHeight = t.h;
+  region.imageSubresource = {1, 0, 0, 1};
+  region.imageExtent = {t.w, t.h, 1};
+  v.vk.CmdCopyImageToBuffer(cb, image, kLayoutTransferSrc, t.buffer, 1, &region);
+}
+
 // --- per frame ----------------------------------------------------------------
 
 inline void ImageBarrier(VkCmd cb, VkH image, uint32_t from, uint32_t to) {
@@ -412,8 +613,11 @@ inline void OnFrame(reshade::api::effect_runtime* runtime, reshade::api::command
   DXGI_FORMAT motion_format = static_cast<DXGI_FORMAT>(md.texture.format);
   if (motion_format == DXGI_FORMAT_R16G16_TYPELESS) motion_format = DXGI_FORMAT_R16G16_FLOAT;
   if (!EnsureShared(v.color, bd.texture.width, bd.texture.height, color_format, "colour") ||
-      !EnsureShared(v.motion, md.texture.width, md.texture.height, motion_format, "motion") ||
-      !EnsureShared(v.depth, dd.texture.width, dd.texture.height, DXGI_FORMAT_R32_FLOAT, "depth") ||
+      !EnsureSharedBuf(v.motion_buf, md.texture.width, md.texture.height, motion_format,
+                       motion_format == DXGI_FORMAT_R32G32_FLOAT ? 8 : 4, "motion") ||
+      !EnsureSharedBuf(v.depth_buf, dd.texture.width, dd.texture.height, DXGI_FORMAT_R32_FLOAT, 4,
+                       "depth") ||
+      !EnsureUnpack() ||
       !EnsureDepth32(dev, dd.texture.width, dd.texture.height))
     return;
 
@@ -435,17 +639,11 @@ inline void OnFrame(reshade::api::effect_runtime* runtime, reshade::api::command
 
   VkCmd cb = reinterpret_cast<VkCmd>(cmd_list->get_native());
   ImageBarrier(cb, v.color.image, kLayoutUndefined, kLayoutTransferDst);
-  ImageBarrier(cb, v.depth.image, kLayoutUndefined, kLayoutTransferDst);
-  ImageBarrier(cb, v.motion.image, kLayoutUndefined, kLayoutTransferDst);
   CopyImage(cb, back_buffer.handle, kLayoutTransferSrc, v.color.image, kLayoutTransferDst,
             v.color.w, v.color.h);
-  CopyImage(cb, v.depth32.handle, kLayoutTransferSrc, v.depth.image, kLayoutTransferDst,
-            v.depth.w, v.depth.h);
-  CopyImage(cb, motion.handle, kLayoutTransferSrc, v.motion.image, kLayoutTransferDst,
-            v.motion.w, v.motion.h);
   ImageBarrier(cb, v.color.image, kLayoutTransferDst, kLayoutGeneral);
-  ImageBarrier(cb, v.depth.image, kLayoutTransferDst, kLayoutGeneral);
-  ImageBarrier(cb, v.motion.image, kLayoutTransferDst, kLayoutGeneral);
+  CopyToBuffer(cb, v.depth32.handle, v.depth_buf);
+  CopyToBuffer(cb, motion.handle, v.motion_buf);
   cmd_list->barrier(motion, resource_usage::copy_source, resource_usage::shader_resource);
 
   // The CPU orders the two APIs: the game's queue runs dry, then the pass runs and is waited on.
@@ -453,7 +651,8 @@ inline void OnFrame(reshade::api::effect_runtime* runtime, reshade::api::command
   queue->flush_immediate_command_list();
   queue->wait_idle();
   bool ran = false;
-  if (nr_runner::OnStandaloneFrame(v.color.tex12, v.depth.tex12, v.motion.tex12, depth_inverted,
+  if (Unpack() &&
+      nr_runner::OnStandaloneFrame(v.color.tex12, v.depth_buf.tex12, v.motion_buf.tex12, depth_inverted,
                                    scale_x, scale_y, D3D12_RESOURCE_STATE_COMMON))
     ran = nr_runner::SubmitStandaloneAndWait(3000);
 
@@ -476,6 +675,13 @@ inline void Shutdown(reshade::api::device* dev) {
   Release(v.color);
   Release(v.depth);
   Release(v.motion);
+  Release(v.depth_buf);
+  Release(v.motion_buf);
+  if (v.unpack_list != nullptr) v.unpack_list->Release();
+  if (v.unpack_alloc != nullptr) v.unpack_alloc->Release();
+  if (v.unpack_queue != nullptr) v.unpack_queue->Release();
+  if (v.unpack_fence != nullptr) v.unpack_fence->Release();
+  if (v.unpack_event != nullptr) CloseHandle(v.unpack_event);
   if (dev != nullptr) {
     if (v.depth32_uav.handle != 0) dev->destroy_resource_view(v.depth32_uav);
     if (v.depth32.handle != 0) dev->destroy_resource(v.depth32);
