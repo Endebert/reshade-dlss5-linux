@@ -215,6 +215,10 @@ constexpr uint32_t kHeartbeatEvery = 600;
 
 // The Reserved18 handle, so evaluates of the NR feature get their own dump.
 inline NVSDK_NGX_Handle* nr_handle = nullptr;
+// The game's own DLSS-SR feature, captured when it is created after this probe installed; null
+// until then (a game may create it before the probe hooks its exports), in which case every
+// evaluate counts as the game's own.
+inline NVSDK_NGX_Handle* sr_handle = nullptr;
 
 static decltype(&NVSDK_NGX_D3D12_CreateFeature) real_D3D12_CreateFeature = nullptr;
 inline NVSDK_NGX_Result NVSDK_CONV HookD3D12CreateFeature(
@@ -234,6 +238,7 @@ inline NVSDK_NGX_Result NVSDK_CONV HookD3D12CreateFeature(
   }
   if (feature_id == NVSDK_NGX_Feature_SuperSampling && result == NVSDK_NGX_Result_Success &&
       params != nullptr) {
+    if (out_handle != nullptr) sr_handle = *out_handle;
     unsigned w = 0, h = 0, ow = 0, oh = 0;
     int flags = 0;
     params->Get(NVSDK_NGX_Parameter_Width, &w);
@@ -270,8 +275,17 @@ inline NVSDK_NGX_Result NVSDK_CONV HookD3D12EvaluateFeature(
   } else if (n % kHeartbeatEvery == 0) {
     Logf("ngx-probe: D3D12_EvaluateFeature #%u (alive)", n);
   }
+  // The pass belongs to the game's own DLSS-SR feature; other NGX features (DLSSD, ...) have
+  // none of its semantics. Before the first SR create has been seen (sr_handle null) every
+  // evaluate counts, and the pass stays out anyway behind the no-DLSS-session gate.
+  const bool sr = sr_handle == nullptr || handle == sr_handle;
+  // Insertion point Render: enhance the color input before the game's DLSS-SR upscales it, on
+  // this same command list, so recording order is the execution order. Upscaled runs the pass
+  // after the evaluate instead, on the success path below.
+  const bool pre = sr && nr_runner::WantPrePass();
+  if (pre) nr_runner::PreDlssEvaluate(cmd_list, params);
   const auto eval_result = real_D3D12_EvaluateFeature(cmd_list, handle, params, callback);
-  if (eval_result == NVSDK_NGX_Result_Success)
+  if (sr && !pre && eval_result == NVSDK_NGX_Result_Success)
     nr_runner::OnDlssEvaluated(cmd_list, params);
   return eval_result;
 }

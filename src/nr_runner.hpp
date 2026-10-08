@@ -183,6 +183,17 @@ struct State {
   unsigned dlss_out_w = 0, dlss_out_h = 0;
   int dlss_create_flags = 0;
 
+  // Insertion point, mirroring RenoDX's hook method: 0 Upscaled runs the pass on the game's
+  // DLSS-SR output after it upscales; 1 Render runs it on the DLSS-SR color input before the
+  // upscale, so the game's own DLSS-SR upscales the enhanced frame. `insertion` is the active
+  // mode, only ever written on the evaluate thread (in PreparePass) so PreSr()/PassW() cannot
+  // flip mid-frame; the overlay writes `insertion_pending` instead. `source` is a second PreSr()
+  // input and is written from the present thread in OnStandaloneFrame; the DLSS-quiet gate (no
+  // evaluates for 3 s) keeps a standalone frame from running alongside an evaluate, which is a
+  // timing argument rather than an enforced invariant.
+  int insertion = 0;
+  std::atomic<int> insertion_pending{0};
+
   // Where the frame comes from. Standalone runs off the back buffer, ReShade's depth and a
   // motion-vector effect, for a D3D12 game with no DLSS session to hook.
   int source = 0;                  // Source
@@ -225,6 +236,14 @@ inline State s;
 
 enum Source : int { kSrcNone = 0, kSrcDlss = 1, kSrcStandalone = 2 };
 enum StandaloneMode : int { kSaAuto = 0, kSaAlways = 1, kSaOff = 2 };
+enum Insertion : int { kInsUpscaled = 0, kInsRender = 1 };
+
+// Whether this frame's pass runs before the game's DLSS-SR upscale (insertion = Render) and on
+// which geometry. Standalone has no DLSS stage to insert in front of, so it always post-processes
+// the frame it was handed.
+inline bool PreSr() { return s.insertion == kInsRender && s.source != kSrcStandalone; }
+inline unsigned PassW() { return PreSr() ? s.render_w : s.out_w; }
+inline unsigned PassH() { return PreSr() ? s.render_h : s.out_h; }
 
 inline const char* ResultName(int r) {
   switch ((unsigned)r) {
@@ -256,13 +275,16 @@ inline bool GiveUp(const char* why) {
 
 // --- model identity -------------------------------------------------------
 
-// Feature 18 only runs stably with the exact model build it was tested against. A mismatched
-// nvngx_dlssnr.dll does not fail at the API -- it reports Success on every evaluate and crashes
-// the game minutes later on an unrelated thread. So the model's version and SHA-256 are logged at
-// init (on a background thread; the file is ~160MB), with a warning when it isn't the tested
-// build, so every user report identifies the model that was actually running.
+// Feature 18 only runs stably with a coherent model build. A mismatched nvngx_dlssnr.dll does
+// not fail at the API -- it reports Success on every evaluate and crashes the game minutes later
+// on an unrelated thread. The model's version and SHA-256 are logged at init (on a background
+// thread; the file is ~160MB), with a warning when it is neither of the two builds known to hold
+// up: the standard 310.8.0 build (what napXDD's README documents) and its RTX 40-series variant
+// (the build every run of this add-on was validated against). Both are 165,840,496 bytes.
 constexpr char kTestedModelSha256[] =
-    "e16bcf15e16e13f527491cdf7845b2fe6521a738d8f7c9c721866a8496e1fc8e";
+    "4b8d19bc3eff58a084f5eca7489c921501c203450169fb82ff4f649a4482ba05";  // RTX 40-series variant
+constexpr char kUpstreamModelSha256[] =
+    "e16bcf15e16e13f527491cdf7845b2fe6521a738d8f7c9c721866a8496e1fc8e";  // standard 310.8.0
 
 inline HANDLE model_id_thread = nullptr;
 
@@ -320,11 +342,13 @@ inline DWORD WINAPI ModelIdentityThread(LPVOID arg) {
 
   ngx_probe::Logf("nr-fwd: model nvngx_dlssnr.dll -- version %s, %llu bytes, sha256=%s", version,
                   total, sha_hex);
-  if (hashed && std::strcmp(sha_hex, kTestedModelSha256) != 0) {
+  if (hashed && std::strcmp(sha_hex, kTestedModelSha256) != 0 &&
+      std::strcmp(sha_hex, kUpstreamModelSha256) != 0) {
     ngx_probe::Warnf(
-        "nr-fwd: this nvngx_dlssnr.dll is NOT the tested model build -- other versions have "
-        "crashed the game mid-session with no API error; tested sha256=%s",
-        kTestedModelSha256);
+        "nr-fwd: this nvngx_dlssnr.dll is neither of the tested model builds -- other versions "
+        "have crashed the game mid-session with no API error; tested sha256=%s (RTX 40-series "
+        "variant) or %s (standard 310.8.0)",
+        kTestedModelSha256, kUpstreamModelSha256);
   }
   std::free(path);
   return 0;
@@ -420,7 +444,8 @@ inline void OnDlssCreate(unsigned w, unsigned h, unsigned ow, unsigned oh, int f
   s.out_w = ow;
   s.out_h = oh;
   s.create_flags = flags;
-  if (s.feature != nullptr && (s.feature_w != ow || s.feature_h != oh))
+  // The pass geometry follows the insertion point: render-res before SR, display-res after.
+  if (s.feature != nullptr && (s.feature_w != PassW() || s.feature_h != PassH()))
     RetireFeature("geometry changed");
 }
 
@@ -542,22 +567,39 @@ inline bool EnsureSetup(ID3D12GraphicsCommandList* cmd) {
   return true;
 }
 
-// Three display-resolution textures in the game's own DLSS output format (accepted by the model
-// in milestone 5a): the model's answer, the copied-aside original, and the encoded proxy.
+// Three textures at the pass geometry (display resolution after the SR upscale, render
+// resolution before it), sourced in the game frame's format (accepted by the model in milestone
+// 5a): the model's answer, the copied-aside original, and the encoded proxy.
 inline bool CreateTextures(ID3D12GraphicsCommandList* cmd, ID3D12Resource* game_output) {
   if (s.output != nullptr) return true;
+
+  const D3D12_RESOURCE_DESC game_desc = game_output->GetDesc();
+  // The pass copies the frame whole (the geometry must match or CopyResource hard-fails
+  // mid-frame) and writes it in place as a UAV (flagged below when absent). Retiring the
+  // feature drops the textures, so a mode switch lands back here and is checked exactly when it
+  // must be.
+  if (game_desc.Width != PassW() || game_desc.Height != PassH())
+    return GiveUp("the game frame does not match the pass geometry");
+  if (PreSr() && (game_desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) == 0) {
+    // NGX does not promise the flag on a color *input*, but this addon only ever runs on
+    // vkd3d-proton, where the write lands regardless -- Control's input buffer is exactly such
+    // a game and renders correctly through it -- so warn with the flags seen instead of
+    // disabling the pass; a native D3D12 debug layer would reject this outright.
+    ngx_probe::Logf("nr-fwd: warning: the DLSS-SR color input lacks ALLOW_UNORDERED_ACCESS "
+                    "(flags=0x%x); writing it anyway under vkd3d",
+                    (unsigned)game_desc.Flags);
+  }
+
   ID3D12Device* device = nullptr;
   if (FAILED(cmd->GetDevice(IID_PPV_ARGS(&device))) || device == nullptr)
     return GiveUp("could not reach the device from the command list");
-
-  const D3D12_RESOURCE_DESC game_desc = game_output->GetDesc();
 
   D3D12_HEAP_PROPERTIES heap = {};
   heap.Type = D3D12_HEAP_TYPE_DEFAULT;
   D3D12_RESOURCE_DESC desc = {};
   desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-  desc.Width = s.out_w;
-  desc.Height = s.out_h;
+  desc.Width = PassW();
+  desc.Height = PassH();
   desc.DepthOrArraySize = 1;
   desc.MipLevels = 1;
   desc.Format = game_desc.Format;
@@ -592,9 +634,11 @@ inline bool CreateTextures(ID3D12GraphicsCommandList* cmd, ID3D12Resource* game_
     s.output = s.color_copy = s.proxy = nullptr;
     return GiveUp("texture creation failed");
   }
-  s.output_format = game_desc.Format;
-  ngx_probe::Logf("nr-fwd: textures %ux%u format=%u (answer, original, proxy)", s.out_w, s.out_h,
-                  (unsigned)s.output_format);
+  const char* mode = s.source == kSrcStandalone   ? "standalone"
+                     : PreSr()                    ? "insertion=render"
+                                                  : "insertion=upscaled";
+  ngx_probe::Logf("nr-fwd: textures %ux%u format=%u (answer, original, proxy, %s)", PassW(),
+                  PassH(), (unsigned)game_desc.Format, mode);
   return true;
 }
 
@@ -671,15 +715,16 @@ inline float DiffuseWhiteToSource(int encoding, float nits) {
 // Called by the overlay after the create-time model settings changed: the model reads them only
 // while building the feature, so it is retired and rebuilt. The overlay runs on the present
 // thread while the evaluate thread owns the feature and textures, so only a flag is set here;
-// the retire itself executes at the top of the next OnDlssEvaluated, on the owning thread.
+// the retire itself executes at the top of the next PreparePass -- either insertion point -- on
+// the owning thread.
 inline void ApplyModelSettings() { s.retire_pending.store(true, std::memory_order_relaxed); }
 
 // Writes the create-time block and builds one feature; nullptr on failure.
 inline void* CreateOne(ID3D12GraphicsCommandList* cmd, int pass) {
   void* p = s.caps;
   SetUInt(p, "DLSSNR.Enabled", 1u);
-  SetUInt(p, "DLSSNR.Width", s.out_w);
-  SetUInt(p, "DLSSNR.Height", s.out_h);
+  SetUInt(p, "DLSSNR.Width", PassW());
+  SetUInt(p, "DLSSNR.Height", PassH());
   SetUInt(p, "CreationNodeMask", 1u);
   SetUInt(p, "VisibilityNodeMask", 1u);
   SetUInt(p, "DLSSNR.Hint.Render.Preset", (unsigned)s.preset);
@@ -700,8 +745,8 @@ inline ID3D12Resource* CreateInter(ID3D12GraphicsCommandList* cmd) {
   heap.Type = D3D12_HEAP_TYPE_DEFAULT;
   D3D12_RESOURCE_DESC desc = {};
   desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-  desc.Width = s.out_w;
-  desc.Height = s.out_h;
+  desc.Width = PassW();
+  desc.Height = PassH();
   desc.DepthOrArraySize = 1;
   desc.MipLevels = 1;
   desc.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
@@ -759,8 +804,12 @@ inline bool EnsureFeature(ID3D12GraphicsCommandList* cmd) {
   s.feature = CreateOne(cmd, 1);
   if (s.feature == nullptr) return GiveUp("feature creation failed");
   s.built_passes = s.pass_count < 1 ? 1 : (s.pass_count > kMaxPasses ? kMaxPasses : s.pass_count);
-  s.feature_w = s.out_w;
-  s.feature_h = s.out_h;
+  s.feature_w = PassW();
+  s.feature_h = PassH();
+  const char* where = s.source == kSrcStandalone   ? "standalone frame"
+                      : PreSr()                    ? "render, before the SR upscale"
+                                                   : "upscaled, after the SR upscale";
+  ngx_probe::Logf("nr-fwd: pass geometry %ux%u (%s)", s.feature_w, s.feature_h, where);
   // Evaluate from the next frame on, so the init work this create recorded executes first.
   return false;
 }
@@ -768,10 +817,13 @@ inline bool EnsureFeature(ID3D12GraphicsCommandList* cmd) {
 // --- the per-frame pass ---------------------------------------------------
 
 // If the model fails after RecordPre already ran, put every state back so the frame proceeds
-// with the original picture untouched.
+// with the original picture untouched: UAV for the post-SR path (the state the game's output is
+// in around DLSS evaluation), NON_PIXEL_SHADER_RESOURCE for the pre-SR path (the state the
+// game's DLSS-SR is about to read its color input in).
 inline void AbortAfterPre(ID3D12GraphicsCommandList* cmd, ID3D12Resource* game_out) {
   nr_compose::Barrier(cmd, game_out, D3D12_RESOURCE_STATE_COPY_SOURCE,
-                      D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                      PreSr() ? D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
+                              : D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
   nr_compose::Barrier(cmd, s.color_copy, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
                       D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
   nr_compose::Barrier(cmd, s.proxy, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
@@ -787,6 +839,9 @@ struct Inputs {
   bool reset = false;
   bool depth_inverted = false;
   unsigned depth_w = 0, depth_h = 0;  // the depth region actually rendered; 0 = render size
+  // The game's DLSS-SR output format, the reference Auto's encode decision keys off in both
+  // insertion modes; UNKNOWN (standalone) falls back to the frame itself.
+  DXGI_FORMAT output_format = DXGI_FORMAT_UNKNOWN;
 };
 
 inline void Evaluate(ID3D12GraphicsCommandList* cmd, const Inputs& in) {
@@ -795,7 +850,19 @@ inline void Evaluate(ID3D12GraphicsCommandList* cmd, const Inputs& in) {
   ID3D12Resource* motion = in.motion;
   if (color == nullptr || depth == nullptr || motion == nullptr) return;
 
+  // The frame's colorimetry does not move with the insertion point, so Auto resolves the same
+  // way in both modes -- from the DLSS-SR output, not whichever resource this mode encodes.
+  s.output_format =
+      in.output_format != DXGI_FORMAT_UNKNOWN ? in.output_format : color->GetDesc().Format;
   if (!CreateTextures(cmd, color)) return;
+
+  // Pre-SR: the frame is the game's DLSS-SR color input, in NON_PIXEL_SHADER_RESOURCE for the
+  // evaluate the original hook is about to make. RecordPre assumes UAV, so hand it over in the
+  // state the compose pass expects and hand it back in the state NGX expects (below, after the
+  // resolve).
+  if (PreSr())
+    nr_compose::Barrier(cmd, color, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 
   // The colour bridge for this frame. Measured mode folds the latest luminance reading (a few
   // frames old, absorbed by the EMA) into the smoothed white point; every other encoding uses a
@@ -822,8 +889,13 @@ inline void Evaluate(ID3D12GraphicsCommandList* cmd, const Inputs& in) {
   s.active_white_point = bridge.white_point;
 
   // Copy the original aside, encode the display-referred proxy, record the measurement.
-  if (!nr_compose::RecordPre(cmd, color, s.color_copy, s.proxy, s.out_w, s.out_h, s.eval_count,
+  if (!nr_compose::RecordPre(cmd, color, s.color_copy, s.proxy, PassW(), PassH(), s.eval_count,
                              bridge)) {
+    // RecordPre fails before its own barriers, so the frame is only in the state the entry
+    // barrier above left it in: hand it back for the evaluate this hook is about to make.
+    if (PreSr())
+      nr_compose::Barrier(cmd, color, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                          D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     GiveUp("compose pipeline initialisation failed");
     return;
   }
@@ -837,19 +909,19 @@ inline void Evaluate(ID3D12GraphicsCommandList* cmd, const Inputs& in) {
   SetResource(p, "DLSSNR.MVec", motion);
 
   SetUInt(p, "DLSSNR.Enabled", 1u);
-  SetUInt(p, "DLSSNR.Width", s.out_w);
-  SetUInt(p, "DLSSNR.Height", s.out_h);
+  SetUInt(p, "DLSSNR.Width", PassW());
+  SetUInt(p, "DLSSNR.Height", PassH());
   SetUInt(p, "DLSSNR.DepthInverted", depth_inverted ? 1u : 0u);
   SetUInt(p, "DLSSNR.Reset", reset != 0 ? 1u : 0u);
 
   SetUInt(p, "DLSSNR.ColorSubrectBaseX", 0u);
   SetUInt(p, "DLSSNR.ColorSubrectBaseY", 0u);
-  SetUInt(p, "DLSSNR.ColorSubrectWidth", s.out_w);
-  SetUInt(p, "DLSSNR.ColorSubrectHeight", s.out_h);
+  SetUInt(p, "DLSSNR.ColorSubrectWidth", PassW());
+  SetUInt(p, "DLSSNR.ColorSubrectHeight", PassH());
   SetUInt(p, "DLSSNR.OutputSubrectBaseX", 0u);
   SetUInt(p, "DLSSNR.OutputSubrectBaseY", 0u);
-  SetUInt(p, "DLSSNR.OutputSubrectWidth", s.out_w);
-  SetUInt(p, "DLSSNR.OutputSubrectHeight", s.out_h);
+  SetUInt(p, "DLSSNR.OutputSubrectWidth", PassW());
+  SetUInt(p, "DLSSNR.OutputSubrectHeight", PassH());
   SetUInt(p, "DLSSNR.DepthSubrectBaseX", 0u);
   SetUInt(p, "DLSSNR.DepthSubrectBaseY", 0u);
   SetUInt(p, "DLSSNR.DepthSubrectWidth", in.depth_w != 0 ? in.depth_w : s.render_w);
@@ -904,23 +976,39 @@ inline void Evaluate(ID3D12GraphicsCommandList* cmd, const Inputs& in) {
   }
   s.fail_streak = 0;
 
-  // Anchor the model's answer to the original and write the blend into the game's output, which
-  // its post-processing reads next.
-  nr_compose::RecordPost(cmd, color, s.color_copy, s.proxy, s.output, s.out_w, s.out_h,
+  // Anchor the model's answer to the original and write the blend into the frame resource: the
+  // game's output for the post-SR path (its post-processing reads it next), the game's DLSS-SR
+  // color input for the pre-SR path (the original evaluate reads it next).
+  nr_compose::RecordPost(cmd, color, s.color_copy, s.proxy, s.output, PassW(), PassH(),
                          s.eval_count, s.transfer, s.max_ratio, s.colour_strength, bridge,
                          (uint32_t)s.debug_view, motion, mv_scale_x, mv_scale_y, depth);
+
+  // Pre-SR: hand the enhanced color back in the state NGX expects its input color in.
+  if (PreSr())
+    nr_compose::Barrier(cmd, color, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
 }
 
-// Called after every successful game DLSS-SR evaluate, on the game's own command list.
-inline void OnDlssEvaluated(ID3D12GraphicsCommandList* cmd, const NVSDK_NGX_Parameter* game_params) {
-  if (s.gave_up || cmd == nullptr || game_params == nullptr) return;
-  if (s.dlss_out_w == 0 || s.dlss_out_h == 0) return;  // no DLSS-SR create seen yet
+// Shared prologue for both insertion points: bookkeeping, source selection, setup. True when
+// the pass should run this frame.
+inline bool PreparePass(ID3D12GraphicsCommandList* cmd, const NVSDK_NGX_Parameter* game_params) {
+  if (s.gave_up || cmd == nullptr || game_params == nullptr) return false;
+  if (s.dlss_out_w == 0 || s.dlss_out_h == 0) return false;  // no DLSS-SR create seen yet
   s.last_dlss_tick = GetTickCount64();  // even while disabled: standalone must stay out
 
   TickGraveyard();
   if (s.retire_pending.exchange(false, std::memory_order_relaxed))
     RetireFeature("model settings changed");
-  if (!s.enabled) return;
+  // The insertion point is swapped here, on the evaluate thread, together with the rebuild its
+  // new geometry needs. This frame's pass is skipped: the hook chose its path (pre or post)
+  // from the old mode, and the rebuilt feature starts on the next frame through the new path.
+  const int pending_insertion = s.insertion_pending.load(std::memory_order_relaxed);
+  if (pending_insertion != s.insertion) {
+    s.insertion = pending_insertion;
+    RetireFeature("insertion point changed");
+    return false;
+  }
+  if (!s.enabled) return false;
 
   if (s.source != kSrcDlss) {
     if (s.source == kSrcStandalone) RetireFeature("the game's DLSS took over from standalone");
@@ -933,13 +1021,14 @@ inline void OnDlssEvaluated(ID3D12GraphicsCommandList* cmd, const NVSDK_NGX_Para
     ngx_probe::Log("nr-fwd: source = the game's DLSS session");
   }
 
-  if (!EnsureSetup(cmd)) return;
-  if (!EnsureFeature(cmd)) return;
+  if (!EnsureSetup(cmd)) return false;
+  if (!EnsureFeature(cmd)) return false;
+  return true;
+}
 
-  // The game's DLSS output is the frame; the model sees its encoded proxy, and the game's DLSS
-  // guides are the model's guides.
-  Inputs in;
-  game_params->Get(NVSDK_NGX_Parameter_Output, &in.color);
+// The game's DLSS guides are the model's guides in both modes: depth and motion vectors are
+// render-resolution in the game's parameter block either way.
+inline void ReadGuides(const NVSDK_NGX_Parameter* game_params, Inputs& in) {
   game_params->Get(NVSDK_NGX_Parameter_Depth, &in.depth);
   game_params->Get(NVSDK_NGX_Parameter_MotionVectors, &in.motion);
   game_params->Get(NVSDK_NGX_Parameter_MV_Scale_X, &in.mv_scale_x);
@@ -948,6 +1037,43 @@ inline void OnDlssEvaluated(ID3D12GraphicsCommandList* cmd, const NVSDK_NGX_Para
   game_params->Get(NVSDK_NGX_Parameter_Reset, &reset);
   in.reset = reset != 0;
   in.depth_inverted = (s.create_flags & NVSDK_NGX_DLSS_Feature_Flags_DepthInverted) != 0;
+}
+
+// Called after every successful game DLSS-SR evaluate, on the game's own command list.
+// Insertion point Upscaled (the default): the frame is the game's DLSS output, so the game's
+// post-processing and tone-mapping consume the enhanced frame.
+inline void OnDlssEvaluated(ID3D12GraphicsCommandList* cmd, const NVSDK_NGX_Parameter* game_params) {
+  if (!PreparePass(cmd, game_params)) return;
+
+  Inputs in;
+  game_params->Get(NVSDK_NGX_Parameter_Output, &in.color);
+  if (in.color != nullptr) in.output_format = in.color->GetDesc().Format;
+  ReadGuides(game_params, in);
+  Evaluate(cmd, in);
+
+  NR_TEST_HOOK_AFTER_EVALUATE();
+}
+
+// Whether the evaluate the hook is about to make should be preceded by the pass (insertion point
+// Render). The hook asks only for the game's own DLSS-SR feature -- its handle captured at
+// create, or every evaluate before the first create has been seen, where the no-DLSS-session
+// gate keeps the pass out anyway -- never for the NR feature's own, which are the pass itself.
+inline bool WantPrePass() { return PreSr(); }
+
+// Called immediately before the game's own DLSS-SR evaluate, on the game's own command list.
+// Insertion point Render: the frame is the DLSS-SR color input at render resolution, enhanced
+// in place, so the game's DLSS-SR then upscales the enhanced frame.
+inline void PreDlssEvaluate(ID3D12GraphicsCommandList* cmd, const NVSDK_NGX_Parameter* game_params) {
+  if (!PreparePass(cmd, game_params)) return;
+
+  Inputs in;
+  game_params->Get(NVSDK_NGX_Parameter_Color, &in.color);
+  // Auto's encode decision keys off the DLSS-SR output, fetched here because this mode's frame
+  // is the color input; the output resource is always in the game's parameter block.
+  ID3D12Resource* dlss_output = nullptr;
+  game_params->Get(NVSDK_NGX_Parameter_Output, &dlss_output);
+  if (dlss_output != nullptr) in.output_format = dlss_output->GetDesc().Format;
+  ReadGuides(game_params, in);
   Evaluate(cmd, in);
 
   NR_TEST_HOOK_AFTER_EVALUATE();
