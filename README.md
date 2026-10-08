@@ -20,9 +20,9 @@ Highlights:
 - **RenoDX-style controls**: Style, the model intensities, Auto Mask, Skin Structure Strength and
   UI Correction, applied as soon as a slider is released.
 - **Pass Count**: run the model up to four times per frame, each pass refining the previous one.
-- **Works in games without DLSS at all.** D3D12 and D3D11 games run in **standalone mode** off
-  ReShade's depth and iMMERSE Launchpad's motion vectors, with nothing else to install. D3D11 and
-  Vulkan games with their own DLSS can go through
+- **Works in games without DLSS at all.** D3D12, D3D11 and Vulkan games run in **standalone
+  mode** off ReShade's depth and iMMERSE Launchpad's motion vectors, with nothing else to install.
+  D3D11 and Vulkan games with their own DLSS can go through
   [dlss5-bridge](https://github.com/NIGos/dlss5-bridge) (see below).
 
 Built on Linux with clang targeting the MSVC ABI (`-target x86_64-pc-windows-msvc`) so the
@@ -34,7 +34,7 @@ vtables and by-value aggregate returns match MSVC-built ReShade.
    - **A DLSS session.** Hooks the game's NGX `CreateFeature` / `EvaluateFeature` (via Microsoft
      Detours) and, after each DLSS-SR evaluate, takes its output, depth and motion vectors. This
      is how native DLSS games and games through dlss5-bridge run.
-   - **Standalone.** In a D3D12 game without DLSS, takes the back buffer, ReShade's depth and
+   - **Standalone.** In a game without DLSS (D3D12, D3D11 or Vulkan), takes the back buffer, ReShade's depth and
      iMMERSE Launchpad's motion vectors right after Launchpad runs, and starts NGX itself.
 2. Runs the DLSSNR model on that frame (once per pass) and composites its answer back. With DLSS
    the game's own tone-mapping then consumes the enhanced frame; standalone writes it to the
@@ -50,7 +50,7 @@ Open the ReShade overlay → *Add-ons* → **DLSSNR Linux**. **F10** toggles the
 comparison. Settings are saved to `ReShade.ini` under `[ADDON_DLSSNR_LINUX]`.
 
 At the top, **Source** shows where the frame comes from (the game's DLSS session or standalone),
-and **Standalone** picks when standalone mode may run: *Auto* (only in a D3D12 game that never
+and **Standalone** picks when standalone mode may run: *Auto* (only in a game that never
 starts DLSS of its own), *Always*, or *Off*. Its status line says what it is waiting for.
 
 **Neural Rendering** (the model's own parameters; changing one rebuilds the model on release)
@@ -110,9 +110,9 @@ one needs.
 - **Proton** with NVAPI/NGX enabled. In a game with DLSS, **turn DLSS (Super Resolution) on
   in-game**: the add-on runs off its output. Games without DLSS: see
   [Games without DLSS 5 support](#games-without-dlss-5-support).
-- **ReShade with add-on support** installed for the game's DX12 renderer (the `dxgi` variant).
-  D3D11 games work through [dlss5-bridge](https://github.com/NIGos/dlss5-bridge), which gives them
-  a D3D12 DLSS session to hook; keep its `unwrap=0`.
+- **ReShade with add-on support** installed for the game's renderer: the `dxgi` variant for
+  D3D12, `d3d11` for D3D11, the layer for Vulkan (see
+  [Vulkan games under Proton](#vulkan-games-under-proton)).
 - The DLSS Neural Rendering model **`nvngx_dlssnr.dll`** present beside the game executable. It is
   NVIDIA's and is *not* shipped here; the add-on only drives it.
   **The model build matters:** the add-on has only run stably with this exact model —
@@ -172,7 +172,7 @@ Native D3D12 games with DLSS need nothing else. For the rest:
 
 | Game | Route |
 |---|---|
-| D3D12 or D3D11, no DLSS | **Standalone mode**: this add-on plus iMMERSE Launchpad. |
+| D3D12, D3D11 or Vulkan, no DLSS | **Standalone mode**: this add-on plus iMMERSE Launchpad. |
 | D3D11 or Vulkan, with DLSS | dlss5-bridge mirrors the game's DLSS (optional: standalone works too). |
 
 Standalone needs ReShade's depth and Launchpad's motion vectors set up, as described under
@@ -180,16 +180,36 @@ Standalone needs ReShade's depth and Launchpad's motion vectors set up, as descr
 
 ### Games without DLSS: standalone mode
 
-1. Install ReShade for the game's API (`dxgi.dll` for D3D12, `d3d11.dll` for D3D11) and this
-   add-on's two files beside the executable. No `nvngx_dlss.dll` and no bridge are needed; while
+1. Install ReShade for the game's API (`dxgi.dll` for D3D12, `d3d11.dll` for D3D11, the layer for
+   Vulkan: see [Vulkan games under Proton](#vulkan-games-under-proton)) and this add-on's two
+   files beside the executable. No `nvngx_dlss.dll` and no bridge are needed; while
    dlss5-bridge is installed, *Auto* leaves the game to it.
 2. Set up depth and Launchpad as below.
 3. Get into gameplay: after about 10 seconds *Auto* starts standalone, and the panel's Source
    line reads **standalone**.
 
-In a D3D12 game the pass runs on the game's own device. A D3D11 game's frame, depth and motion
-vectors are copied to a private D3D12 device each frame and the result is copied back; ordinary
-D3D11 games need nothing extra for that.
+In a D3D12 game the pass runs on the game's own device. A D3D11 or Vulkan game's frame, depth and
+motion vectors are copied to a private D3D12 device each frame and the result is copied back. In a
+Vulkan game the game's GPU queue waits on an event while the pass runs, so the result lands in
+the same frame.
+
+#### Vulkan games under Proton
+
+Proton's built-in Vulkan loader does not load Windows layers, and ReShade on Vulkan is one. So:
+
+1. Run the ReShade installer for the game with **Vulkan** selected. It puts `ReShade64.dll` and
+   `ReShade64.json` beside the executable.
+2. Put a native 64-bit Khronos `vulkan-1.dll` beside the executable (from the Vulkan Runtime, or
+   from another game that ships one) and add `WINEDLLOVERRIDES="vulkan-1=n"` to the launch
+   options.
+3. Register the layer in the game's prefix. Wine runs games elevated, so the loader ignores layer
+   environment variables and reads only the machine-wide registry key:
+
+   ```
+   protontricks -c 'wine reg add "HKLM\Software\Khronos\Vulkan\ImplicitLayers" /v "Z:\path\to\game\ReShade64.json" /t REG_DWORD /d 0 /f' <appid>
+   ```
+
+   with the game folder's path written as a Windows path (`Z:` is `/`).
 
 The add-on asks Launchpad for its motion vectors itself; Launchpad computes them only when some
 effect requests them. If the GPU ever stops finishing frames, standalone switches itself off
@@ -253,6 +273,9 @@ session fed approximated inputs, so text can soften and dense foliage can smear 
      part of the buffer. Set `RESHADE_DEPTH_INPUT_X_SCALE` and `RESHADE_DEPTH_INPUT_Y_SCALE` to
      1 / the render scale: 1.5 for Quality, 1.724 for Balanced, 2 for Performance, 3 for Ultra
      Performance. Turn dynamic resolution off. Launchpad and the add-on both follow these.
+   The add-on follows `IS_REVERSED` and `IS_UPSIDE_DOWN` too. In D3D11 and Vulkan standalone, a
+   depth buffer smaller than the screen (a game rendering below output resolution into its own
+   smaller buffer) is scaled up to the screen.
 4. Keep ReShade's **Performance Mode** and **Skip Loading Disabled Effects** off. The bridge reads
    depth through a loaded effect that uses it; with either on, only enabled effects load.
 5. Check *Debug → Debug view → Motion vectors*: things that move show red and green.
@@ -326,9 +349,11 @@ This project was studied from, and stands on, the following work. Please support
   add-on approach, the DLSS5 colour-bridge composition concepts (display-referred encode, anchored
   resolve), the Encoding / Diffuse White model and its defaults, and the layout of the Neural
   Rendering controls.
-- **dlss5-bridge** by NIGos (<https://github.com/NIGos/dlss5-bridge>) — MIT. The D3D11 standalone
-  transport follows its recipe for sharing textures and a fence between D3D11 and a private D3D12
-  device under Proton, including the depth conversion and the 12_x feature level.
+- **dlss5-bridge** by NIGos (<https://github.com/NIGos/dlss5-bridge>) — MIT. The D3D11 and Vulkan
+  standalone transports follow its recipes for sharing textures with a private D3D12 device under
+  Proton: for D3D11 a shared fence, the depth conversion and the 12_x feature level; for Vulkan
+  the import of D3D12 textures into the game's device and the event "park" that orders the two
+  APIs.
 - **ReShade** by Patrick Mours (<https://github.com/crosire/reshade>) — the add-on SDK / API this
   loads into.
 - **Microsoft Detours** (<https://github.com/microsoft/Detours>) — MIT. Used to hook NGX.
