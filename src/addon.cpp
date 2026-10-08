@@ -386,9 +386,10 @@ struct Edit {
   }
 };
 
-// Tooltip on the item just drawn, RenoDX-style.
+// Tooltip on the item just drawn, RenoDX-style. AllowWhenDisabled: a grayed-out item is exactly
+// when the tip explaining it is needed.
 void Tip(const char* text) {
-  if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", text);
+  if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip("%s", text);
 }
 
 // A reset button on the right of the item just drawn.
@@ -465,14 +466,14 @@ void OnDrawOverlay(reshade::api::effect_runtime*) {
     int insertion = s.insertion_pending.load(std::memory_order_relaxed);
     ImGui::BeginDisabled(s.source == nr_runner::kSrcStandalone);
     const Edit ins = Combo(
-        "Insertion point", &insertion,
+        "Insertion point (DLSS only)", &insertion,
         "Upscaled (after DLSS-SR)\0Render (before DLSS-SR)\0", 0,
-        "Where the pass sits around the game's own DLSS-SR. Upscaled (RenoDX's Upscaled/Present) "
-        "runs it on the upscaled frame, and the game's post-processing consumes the enhanced "
-        "result. Render (RenoDX's Render) runs it on the render-resolution color input before "
-        "the upscale, so DLSS-SR then upscales the enhanced frame: cheaper, and stabilized by "
-        "SR's temporal filter, but SR smooths the structure the model synthesized. "
-        "DLSS-session source only.");
+        "DLSS-session games only: grayed out in standalone, where the game has no DLSS-SR stage "
+        "to insert in front of. Upscaled (RenoDX's Upscaled/Present) runs it on the upscaled "
+        "frame, and the game's post-processing consumes the enhanced result. Render (RenoDX's "
+        "Render) runs it on the render-resolution color input before the upscale, so DLSS-SR "
+        "then upscales the enhanced frame: cheaper, and stabilized by SR's temporal filter, but "
+        "SR smooths the structure the model synthesized.");
     ImGui::EndDisabled();
     if (ins.changed) s.insertion_pending.store(insertion, std::memory_order_relaxed);
     // Config-only bucket: the mode swap in PreparePass retires the feature itself, so it can
