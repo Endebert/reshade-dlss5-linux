@@ -115,12 +115,11 @@ one needs.
   [Vulkan games under Proton](#vulkan-games-under-proton)).
 - The DLSS Neural Rendering model **`nvngx_dlssnr.dll`** present beside the game executable. It is
   NVIDIA's and is *not* shipped here; the add-on only drives it.
-  **The model build matters:** the add-on has only run stably with this exact model —
-  `sha256 e16bcf15e16e13f527491cdf7845b2fe6521a738d8f7c9c721866a8496e1fc8e` (165,840,496 bytes).
-  A different model version may not fail cleanly: in testing, a mismatched model reported Success
-  on every evaluate and then **crashed the game minutes into gameplay**. The add-on logs the
-  model's version and SHA-256 to `ReShade.log` at startup (`nr-fwd: model nvngx_dlssnr.dll ...`)
-  and warns when it isn't the tested build.
+  **The model version matters:** the add-on has been tested with model **310.8.0**. A different
+  model version may not fail cleanly: in testing, a mismatched model reported Success on every
+  evaluate and then **crashed the game minutes into gameplay**. The add-on logs the model's
+  version and SHA-256 to `ReShade.log` at startup (`nr-fwd: model nvngx_dlssnr.dll ...`); include
+  that line when reporting a problem.
 
 Tested on RTX 50-series cards under Proton. The [Tested Games](https://github.com/RianGoossens/reshade-dlss5-linux/wiki/Tested-Games) wiki page lists the games
 and setups confirmed working.

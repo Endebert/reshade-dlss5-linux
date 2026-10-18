@@ -264,13 +264,11 @@ inline bool GiveUp(const char* why) {
 
 // --- model identity -------------------------------------------------------
 
-// Feature 18 only runs stably with the exact model build it was tested against. A mismatched
-// nvngx_dlssnr.dll does not fail at the API -- it reports Success on every evaluate and crashes
-// the game minutes later on an unrelated thread. So the model's version and SHA-256 are logged at
-// init (on a background thread; the file is ~160MB), with a warning when it isn't the tested
-// build, so every user report identifies the model that was actually running.
-constexpr char kTestedModelSha256[] =
-    "e16bcf15e16e13f527491cdf7845b2fe6521a738d8f7c9c721866a8496e1fc8e";
+// A mismatched nvngx_dlssnr.dll does not fail at the API -- it can report Success on every
+// evaluate and crash the game minutes later on an unrelated thread. So the model's version and
+// SHA-256 are logged at init (on a background thread; the file is ~160MB), so every user report
+// identifies the model that was actually running. Several builds of 310.8.0 with the same size
+// circulate and have run fine, so no single hash is singled out as the right one.
 
 inline HANDLE model_id_thread = nullptr;
 
@@ -294,7 +292,6 @@ inline DWORD WINAPI ModelIdentityThread(LPVOID arg) {
 
   char sha_hex[65] = "unreadable";
   unsigned long long total = 0;
-  bool hashed = false;
   const HANDLE file = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
                                   FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
   if (file != INVALID_HANDLE_VALUE) {
@@ -315,10 +312,8 @@ inline DWORD WINAPI ModelIdentityThread(LPVOID arg) {
         }
         total += read;
       }
-      if (ok && BCryptFinishHash(hash, digest, sizeof(digest), 0) == 0) {
+      if (ok && BCryptFinishHash(hash, digest, sizeof(digest), 0) == 0)
         for (int i = 0; i < 32; ++i) std::snprintf(sha_hex + i * 2, 3, "%02x", digest[i]);
-        hashed = true;
-      }
     }
     if (hash != nullptr) BCryptDestroyHash(hash);
     if (alg != nullptr) BCryptCloseAlgorithmProvider(alg, 0);
@@ -328,12 +323,6 @@ inline DWORD WINAPI ModelIdentityThread(LPVOID arg) {
 
   ngx_probe::Logf("nr-fwd: model nvngx_dlssnr.dll -- version %s, %llu bytes, sha256=%s", version,
                   total, sha_hex);
-  if (hashed && std::strcmp(sha_hex, kTestedModelSha256) != 0) {
-    ngx_probe::Warnf(
-        "nr-fwd: this nvngx_dlssnr.dll is NOT the tested model build -- other versions have "
-        "crashed the game mid-session with no API error; tested sha256=%s",
-        kTestedModelSha256);
-  }
   std::free(path);
   return 0;
 }
