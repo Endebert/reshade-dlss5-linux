@@ -202,6 +202,14 @@ struct State {
   bool sa_flip_x = false, sa_flip_y = false;  // motion-vector direction, standalone only
   bool temporal = true;            // false resets the model's history every frame (diagnostic)
   ID3D12Resource* sa_frame = nullptr;  // UAV-capable copy of the back buffer
+  // Reduced resolution: when depth is smaller than the screen (a game that renders its scene
+  // below the output resolution), the model runs at depth's size. sa_frame is then that size;
+  // these carry the rest.
+  bool sa_reduced = false;
+  ID3D12Resource* sa_given = nullptr;  // the downscaled frame as the model was given it
+  ID3D12Resource* sa_delta = nullptr;  // the model's change, RGBA16F
+  ID3D12Resource* sa_mv = nullptr;     // motion vectors at the model's size
+  ID3D12Resource* sa_full = nullptr;   // the full-resolution result
   DXGI_FORMAT sa_format = DXGI_FORMAT_UNKNOWN;
   HMODULE ngx_core = nullptr;      // _nvngx.dll, when standalone had to start NGX itself
   // Standalone records on its own command list, made from ReShade's proxy device (the device
@@ -275,16 +283,11 @@ inline bool GiveUp(const char* why) {
 
 // --- model identity -------------------------------------------------------
 
-// Feature 18 only runs stably with a coherent model build. A mismatched nvngx_dlssnr.dll does
-// not fail at the API -- it reports Success on every evaluate and crashes the game minutes later
-// on an unrelated thread. The model's version and SHA-256 are logged at init (on a background
-// thread; the file is ~160MB), with a warning when it is neither of the two builds known to hold
-// up: the standard 310.8.0 build (what napXDD's README documents) and its RTX 40-series variant
-// (the build every run of this add-on was validated against). Both are 165,840,496 bytes.
-constexpr char kTestedModelSha256[] =
-    "4b8d19bc3eff58a084f5eca7489c921501c203450169fb82ff4f649a4482ba05";  // RTX 40-series variant
-constexpr char kUpstreamModelSha256[] =
-    "e16bcf15e16e13f527491cdf7845b2fe6521a738d8f7c9c721866a8496e1fc8e";  // standard 310.8.0
+// A mismatched nvngx_dlssnr.dll does not fail at the API -- it can report Success on every
+// evaluate and crash the game minutes later on an unrelated thread. So the model's version and
+// SHA-256 are logged at init (on a background thread; the file is ~160MB), so every user report
+// identifies the model that was actually running. Several builds of 310.8.0 with the same size
+// circulate and have run fine, so no single hash is singled out as the right one.
 
 inline HANDLE model_id_thread = nullptr;
 
@@ -308,7 +311,6 @@ inline DWORD WINAPI ModelIdentityThread(LPVOID arg) {
 
   char sha_hex[65] = "unreadable";
   unsigned long long total = 0;
-  bool hashed = false;
   const HANDLE file = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
                                   FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
   if (file != INVALID_HANDLE_VALUE) {
@@ -329,10 +331,8 @@ inline DWORD WINAPI ModelIdentityThread(LPVOID arg) {
         }
         total += read;
       }
-      if (ok && BCryptFinishHash(hash, digest, sizeof(digest), 0) == 0) {
+      if (ok && BCryptFinishHash(hash, digest, sizeof(digest), 0) == 0)
         for (int i = 0; i < 32; ++i) std::snprintf(sha_hex + i * 2, 3, "%02x", digest[i]);
-        hashed = true;
-      }
     }
     if (hash != nullptr) BCryptDestroyHash(hash);
     if (alg != nullptr) BCryptCloseAlgorithmProvider(alg, 0);
@@ -342,14 +342,6 @@ inline DWORD WINAPI ModelIdentityThread(LPVOID arg) {
 
   ngx_probe::Logf("nr-fwd: model nvngx_dlssnr.dll -- version %s, %llu bytes, sha256=%s", version,
                   total, sha_hex);
-  if (hashed && std::strcmp(sha_hex, kTestedModelSha256) != 0 &&
-      std::strcmp(sha_hex, kUpstreamModelSha256) != 0) {
-    ngx_probe::Warnf(
-        "nr-fwd: this nvngx_dlssnr.dll is neither of the tested model builds -- other versions "
-        "have crashed the game mid-session with no API error; tested sha256=%s (RTX 40-series "
-        "variant) or %s (standard 310.8.0)",
-        kTestedModelSha256, kUpstreamModelSha256);
-  }
   std::free(path);
   return 0;
 }
@@ -474,6 +466,10 @@ inline void Shutdown() {
   s.proxy = nullptr;
   if (s.sa_frame != nullptr) s.sa_frame->Release();
   s.sa_frame = nullptr;
+  for (ID3D12Resource** r : {&s.sa_given, &s.sa_delta, &s.sa_mv, &s.sa_full}) {
+    if (*r != nullptr) (*r)->Release();
+    *r = nullptr;
+  }
   if (s.sa_fence_out != nullptr && s.sa_event != nullptr &&
       s.sa_fence_out->GetCompletedValue() < s.sa_value) {
     s.sa_fence_out->SetEventOnCompletion(s.sa_value, s.sa_event);
@@ -1128,47 +1124,68 @@ inline DXGI_FORMAT UavTwin(DXGI_FORMAT f) {
   }
 }
 
-inline bool EnsureStandaloneFrame(ID3D12GraphicsCommandList* cmd, ID3D12Resource* back_buffer) {
-  const D3D12_RESOURCE_DESC bb = back_buffer->GetDesc();
-  const DXGI_FORMAT format = UavTwin(bb.Format);
-  if (s.sa_frame != nullptr && s.sa_format == format && s.out_w == (unsigned)bb.Width &&
-      s.out_h == bb.Height)
-    return true;
-  if (s.feature != nullptr) RetireFeature("standalone frame changed size or format");
-  if (s.sa_frame != nullptr) {
-    Drop(s.sa_frame, nullptr, StandaloneIdle(2000));
-    s.sa_frame = nullptr;
-  }
-  s.out_w = s.render_w = (unsigned)bb.Width;
-  s.out_h = s.render_h = bb.Height;
-  s.create_flags = 0;
-
-  ID3D12Device* device = nullptr;
-  if (FAILED(cmd->GetDevice(IID_PPV_ARGS(&device))) || device == nullptr) return false;
+inline ID3D12Resource* MakeUavTexture(ID3D12Device* device, UINT w, UINT h, DXGI_FORMAT format) {
   D3D12_HEAP_PROPERTIES heap = {};
   heap.Type = D3D12_HEAP_TYPE_DEFAULT;
   D3D12_RESOURCE_DESC desc = {};
   desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-  desc.Width = bb.Width;
-  desc.Height = bb.Height;
+  desc.Width = w;
+  desc.Height = h;
   desc.DepthOrArraySize = 1;
   desc.MipLevels = 1;
   desc.Format = format;
   desc.SampleDesc.Count = 1;
   desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+  ID3D12Resource* r = nullptr;
   const HRESULT hr = device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
                                                      D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-                                                     nullptr, IID_PPV_ARGS(&s.sa_frame));
-  device->Release();
+                                                     nullptr, IID_PPV_ARGS(&r));
   if (FAILED(hr)) {
-    s.sa_frame = nullptr;
-    ngx_probe::Logf("nr-fwd: standalone frame texture (%ux%u format %u) failed: 0x%08x",
-                    s.out_w, s.out_h, (unsigned)format, (unsigned)hr);
-    return false;
+    ngx_probe::Logf("nr-fwd: standalone texture %ux%u format %u failed: 0x%08x", w, h,
+                    (unsigned)format, (unsigned)hr);
+    return nullptr;
   }
+  return r;
+}
+
+// The textures the pass works on: sa_frame at the model's size (work_w x work_h), plus, when that
+// is below the back buffer's size, the reduced-resolution set.
+inline bool EnsureStandaloneFrame(ID3D12GraphicsCommandList* cmd, ID3D12Resource* back_buffer,
+                                  UINT work_w, UINT work_h) {
+  const D3D12_RESOURCE_DESC bb = back_buffer->GetDesc();
+  const DXGI_FORMAT format = UavTwin(bb.Format);
+  const bool reduced = work_w != (UINT)bb.Width || work_h != bb.Height;
+  if (s.sa_frame != nullptr && s.sa_format == format && s.out_w == work_w && s.out_h == work_h &&
+      s.sa_reduced == reduced &&
+      (!reduced || (s.sa_full != nullptr && s.sa_full->GetDesc().Width == bb.Width &&
+                    s.sa_full->GetDesc().Height == bb.Height)))
+    return true;
+  if (s.feature != nullptr) RetireFeature("standalone frame changed size or format");
+  const bool idle = StandaloneIdle(2000);
+  for (ID3D12Resource** r : {&s.sa_frame, &s.sa_given, &s.sa_delta, &s.sa_mv, &s.sa_full}) {
+    if (*r != nullptr) Drop(*r, nullptr, idle);
+    *r = nullptr;
+  }
+  s.out_w = s.render_w = work_w;
+  s.out_h = s.render_h = work_h;
+  s.create_flags = 0;
+  s.sa_reduced = reduced;
+
+  ID3D12Device* device = nullptr;
+  if (FAILED(cmd->GetDevice(IID_PPV_ARGS(&device))) || device == nullptr) return false;
+  bool ok = (s.sa_frame = MakeUavTexture(device, work_w, work_h, format)) != nullptr;
+  if (ok && reduced) {
+    ok = (s.sa_given = MakeUavTexture(device, work_w, work_h, format)) != nullptr &&
+         (s.sa_delta = MakeUavTexture(device, work_w, work_h, DXGI_FORMAT_R16G16B16A16_FLOAT)) != nullptr &&
+         (s.sa_mv = MakeUavTexture(device, work_w, work_h, DXGI_FORMAT_R16G16_FLOAT)) != nullptr &&
+         (s.sa_full = MakeUavTexture(device, (UINT)bb.Width, bb.Height, format)) != nullptr;
+  }
+  device->Release();
+  if (!ok) return false;
   s.sa_format = format;
-  ngx_probe::Logf("nr-fwd: standalone frame %ux%u format=%u (back buffer format %u)", s.out_w,
-                  s.out_h, (unsigned)format, (unsigned)bb.Format);
+  ngx_probe::Logf("nr-fwd: standalone frame %ux%u format=%u (back buffer %llux%u format %u)%s",
+                  s.out_w, s.out_h, (unsigned)format, (unsigned long long)bb.Width, bb.Height,
+                  (unsigned)bb.Format, reduced ? ", reduced resolution" : "");
   return true;
 }
 
@@ -1290,7 +1307,14 @@ inline bool OnStandaloneFrame(ID3D12Resource* back_buffer, ID3D12Resource* depth
   }
   const D3D12_RESOURCE_DESC bb = back_buffer->GetDesc();
   const D3D12_RESOURCE_DESC dd = depth->GetDesc();
-  if (dd.Width != bb.Width || dd.Height != bb.Height) {
+  // Depth smaller than the screen at the same aspect ratio: the game renders its scene below the
+  // output resolution, and the model runs at the scene's resolution (reduced mode).
+  const double aspect_error =
+      (double)dd.Width * bb.Height - (double)dd.Height * (double)bb.Width;
+  const bool same_aspect =
+      aspect_error * aspect_error <= 0.0004 * ((double)bb.Width * bb.Height) *
+                                         ((double)bb.Width * bb.Height);
+  if (dd.Width > bb.Width || dd.Height > bb.Height || !same_aspect) {
     std::snprintf(s.sa_status, sizeof(s.sa_status),
                   "waiting: depth is %llux%u, the screen %llux%u -- pick the screen-sized buffer",
                   (unsigned long long)dd.Width, dd.Height, (unsigned long long)bb.Width,
@@ -1328,23 +1352,41 @@ inline bool OnStandaloneFrame(ID3D12Resource* back_buffer, ID3D12Resource* depth
   s.sa_pending = true;  // from here on the list is submitted, even if the pass bails out
 
   if (!EnsureNgxCore(cmd)) return true;
-  if (!EnsureStandaloneFrame(cmd, back_buffer)) return true;
+  if (!EnsureStandaloneFrame(cmd, back_buffer, (UINT)dd.Width, dd.Height)) return true;
   if (!EnsureSetup(cmd)) return true;
   if (!EnsureFeature(cmd)) return true;  // created this frame; it recorded init work
 
   using nr_compose::Barrier;
-  // Back buffer -> the UAV-capable frame copy the pass works on in place.
-  Barrier(cmd, back_buffer, bb_state, D3D12_RESOURCE_STATE_COPY_SOURCE);
-  Barrier(cmd, s.sa_frame, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST);
-  cmd->CopyResource(s.sa_frame, back_buffer);
-  Barrier(cmd, s.sa_frame, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-  Barrier(cmd, back_buffer, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
+  const UINT full_w = (UINT)bb.Width, full_h = bb.Height;
+  const uint32_t frame = (uint32_t)s.sa_value;
+  if (s.sa_reduced) {
+    // Back buffer -> the model's size, kept aside as given; motion vectors to the same grid.
+    Barrier(cmd, back_buffer, bb_state, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    nr_compose::ScalePass(cmd, nr_compose::kScaleDown, back_buffer, back_buffer, s.sa_frame,
+                          s.out_w, s.out_h, frame, s.sa_format);
+    nr_compose::ScalePass(cmd, nr_compose::kScaleMotion, motion, motion, s.sa_mv, s.out_w,
+                          s.out_h, frame);
+    Barrier(cmd, s.sa_frame, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    Barrier(cmd, s.sa_given, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST);
+    cmd->CopyResource(s.sa_given, s.sa_frame);
+    Barrier(cmd, s.sa_given, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    Barrier(cmd, s.sa_frame, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    Barrier(cmd, s.sa_mv, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+  } else {
+    // Back buffer -> the UAV-capable frame copy the pass works on in place.
+    Barrier(cmd, back_buffer, bb_state, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    Barrier(cmd, s.sa_frame, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST);
+    cmd->CopyResource(s.sa_frame, back_buffer);
+    Barrier(cmd, s.sa_frame, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    Barrier(cmd, back_buffer, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
+  }
 
   // Launchpad's motion vectors are in UV units; NGX scales them to pixels.
   Inputs in;
   in.color = s.sa_frame;
   in.depth = depth;
-  in.motion = motion;
+  in.motion = s.sa_reduced ? s.sa_mv : motion;
   in.mv_scale_x = (float)s.out_w * (s.sa_flip_x ? -1.0f : 1.0f);
   in.mv_scale_y = (float)s.out_h * (s.sa_flip_y ? -1.0f : 1.0f);
   in.depth_inverted = depth_inverted;
@@ -1355,12 +1397,39 @@ inline bool OnStandaloneFrame(ID3D12Resource* back_buffer, ID3D12Resource* depth
   if (depth_scale_y > 1.0f) in.depth_h = (unsigned)((float)s.out_h / depth_scale_y + 0.5f);
   Evaluate(cmd, in);
 
-  // The result (or, if the pass bailed out, the untouched copy) goes back to the back buffer.
-  Barrier(cmd, s.sa_frame, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
-  cmd->CopyResource(back_buffer, s.sa_frame);
-  Barrier(cmd, s.sa_frame, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-  Barrier(cmd, back_buffer, D3D12_RESOURCE_STATE_COPY_DEST, bb_state);
-  std::snprintf(s.sa_status, sizeof(s.sa_status), "running, %ux%u", s.out_w, s.out_h);
+  if (s.sa_reduced) {
+    // The model's change, scaled up onto the full-resolution frame.
+    constexpr D3D12_RESOURCE_STATES kRead = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    Barrier(cmd, s.sa_mv,
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    Barrier(cmd, s.sa_frame, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, kRead);
+    Barrier(cmd, s.sa_given, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, kRead);
+    nr_compose::ScalePass(cmd, nr_compose::kScaleDelta, s.sa_frame, s.sa_given, s.sa_delta,
+                          s.out_w, s.out_h, frame);
+    Barrier(cmd, s.sa_delta, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, kRead);
+    nr_compose::ScalePass(cmd, nr_compose::kScaleUp, back_buffer, s.sa_delta, s.sa_full, full_w,
+                          full_h, frame, s.sa_format);
+    Barrier(cmd, s.sa_delta, kRead, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    Barrier(cmd, s.sa_given, kRead, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    Barrier(cmd, s.sa_frame, kRead, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    Barrier(cmd, s.sa_full, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    Barrier(cmd, back_buffer, kRead, D3D12_RESOURCE_STATE_COPY_DEST);
+    cmd->CopyResource(back_buffer, s.sa_full);
+    Barrier(cmd, s.sa_full, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    Barrier(cmd, back_buffer, D3D12_RESOURCE_STATE_COPY_DEST, bb_state);
+  } else {
+    // The result (or, if the pass bailed out, the untouched copy) goes back to the back buffer.
+    Barrier(cmd, s.sa_frame, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    cmd->CopyResource(back_buffer, s.sa_frame);
+    Barrier(cmd, s.sa_frame, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    Barrier(cmd, back_buffer, D3D12_RESOURCE_STATE_COPY_DEST, bb_state);
+  }
+  if (s.sa_reduced)
+    std::snprintf(s.sa_status, sizeof(s.sa_status), "running, %ux%u (model at %ux%u)", full_w,
+                  full_h, s.out_w, s.out_h);
+  else
+    std::snprintf(s.sa_status, sizeof(s.sa_status), "running, %ux%u", s.out_w, s.out_h);
   return true;
 }
 

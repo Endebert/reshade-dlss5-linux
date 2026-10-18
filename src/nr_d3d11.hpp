@@ -306,7 +306,7 @@ inline void OnFrame(ID3D11Device* dev11, ID3D11DeviceContext* ctx, ID3D11Resourc
 
   if (!EnsureShared(d.color, bd.Width, bd.Height, ColorFormat(bd.Format), false, "colour") ||
       !EnsureShared(d.motion, md.Width, md.Height, MotionFormat(md.Format), false, "motion") ||
-      !EnsureShared(d.depth, bd.Width, bd.Height, DXGI_FORMAT_R32_FLOAT, true, "depth")) {
+      !EnsureShared(d.depth, dd.Width, dd.Height, DXGI_FORMAT_R32_FLOAT, true, "depth")) {
     release();
     return;
   }
@@ -323,7 +323,7 @@ inline void OnFrame(ID3D11Device* dev11, ID3D11DeviceContext* ctx, ID3D11Resourc
   ctx->CSSetShader(depth_upside_down ? d.depth_cs_flip : d.depth_cs, nullptr, 0);
   ctx->CSSetShaderResources(0, 1, &depth_srv);
   ctx->CSSetUnorderedAccessViews(0, 1, &d.depth_uav, nullptr);
-  ctx->Dispatch((bd.Width + 7) / 8, (bd.Height + 7) / 8, 1);
+  ctx->Dispatch((dd.Width + 7) / 8, (dd.Height + 7) / 8, 1);
   ID3D11ShaderResourceView* no_srv = nullptr;
   ID3D11UnorderedAccessView* no_uav = nullptr;
   ctx->CSSetShaderResources(0, 1, &no_srv);

@@ -118,15 +118,11 @@ one needs.
   [Vulkan games under Proton](#vulkan-games-under-proton)).
 - The DLSS Neural Rendering model **`nvngx_dlssnr.dll`** present beside the game executable. It is
   NVIDIA's and is *not* shipped here; the add-on only drives it.
-  **The model build matters:** the add-on has only run stably with one of two builds of model
-  310.8.0 (both 165,840,496 bytes) —
-  `sha256 e16bcf15e16e13f527491cdf7845b2fe6521a738d8f7c9c721866a8496e1fc8e` (the standard build)
-  or `sha256 4b8d19bc3eff58a084f5eca7489c921501c203450169fb82ff4f649a4482ba05` (the RTX
-  40-series variant, what this add-on's runs were validated against on an RTX 4090).
-  A different model version may not fail cleanly: in testing, a mismatched model reported Success
-  on every evaluate and then **crashed the game minutes into gameplay**. The add-on logs the
-  model's version and SHA-256 to `ReShade.log` at startup (`nr-fwd: model nvngx_dlssnr.dll ...`)
-  and warns when it is neither tested build.
+  **The model version matters:** the add-on has been tested with model **310.8.0**. A different
+  model version may not fail cleanly: in testing, a mismatched model reported Success on every
+  evaluate and then **crashed the game minutes into gameplay**. The add-on logs the model's
+  version and SHA-256 to `ReShade.log` at startup (`nr-fwd: model nvngx_dlssnr.dll ...`); include
+  that line when reporting a problem.
 
 Tested on RTX 50- and RTX 40-series cards under Proton. The [Tested Games](https://github.com/RianGoossens/reshade-dlss5-linux/wiki/Tested-Games) wiki page lists the games
 and setups confirmed working.
@@ -279,9 +275,15 @@ session fed approximated inputs, so text can soften and dense foliage can smear 
      part of the buffer. Set `RESHADE_DEPTH_INPUT_X_SCALE` and `RESHADE_DEPTH_INPUT_Y_SCALE` to
      1 / the render scale: 1.5 for Quality, 1.724 for Balanced, 2 for Performance, 3 for Ultra
      Performance. Turn dynamic resolution off. Launchpad and the add-on both follow these.
-   The add-on follows `IS_REVERSED` and `IS_UPSIDE_DOWN` too. In D3D11 and Vulkan standalone, a
-   depth buffer smaller than the screen (a game rendering below output resolution into its own
-   smaller buffer) is scaled up to the screen.
+   The add-on follows `IS_REVERSED` and `IS_UPSIDE_DOWN` too (the flip in D3D11 and Vulkan
+   standalone).
+   - **Depth buffer smaller than the screen?** Some games render the scene into their own smaller
+     buffers and draw the UI at full size; Detroit: Become Human keeps a desktop-sized swapchain
+     whatever its resolution setting. Standalone then runs the model at the depth buffer's
+     resolution and adds only the model's change, scaled up, onto the full-resolution frame: the
+     UI stays sharp and the model costs what it would at the lower resolution. The status line
+     reads e.g. *running, 3840x2160 (model at 2560x1440)*. Lowering such a game's resolution
+     setting is therefore a real performance control.
 4. Keep ReShade's **Performance Mode** and **Skip Loading Disabled Effects** off. The bridge reads
    depth through a loaded effect that uses it; with either on, only enabled effects load.
 5. Check *Debug → Debug view → Motion vectors*: things that move show red and green.
