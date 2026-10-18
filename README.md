@@ -273,9 +273,15 @@ session fed approximated inputs, so text can soften and dense foliage can smear 
      part of the buffer. Set `RESHADE_DEPTH_INPUT_X_SCALE` and `RESHADE_DEPTH_INPUT_Y_SCALE` to
      1 / the render scale: 1.5 for Quality, 1.724 for Balanced, 2 for Performance, 3 for Ultra
      Performance. Turn dynamic resolution off. Launchpad and the add-on both follow these.
-   The add-on follows `IS_REVERSED` and `IS_UPSIDE_DOWN` too. In D3D11 and Vulkan standalone, a
-   depth buffer smaller than the screen (a game rendering below output resolution into its own
-   smaller buffer) is scaled up to the screen.
+   The add-on follows `IS_REVERSED` and `IS_UPSIDE_DOWN` too (the flip in D3D11 and Vulkan
+   standalone).
+   - **Depth buffer smaller than the screen?** Some games render the scene into their own smaller
+     buffers and draw the UI at full size; Detroit: Become Human keeps a desktop-sized swapchain
+     whatever its resolution setting. Standalone then runs the model at the depth buffer's
+     resolution and adds only the model's change, scaled up, onto the full-resolution frame: the
+     UI stays sharp and the model costs what it would at the lower resolution. The status line
+     reads e.g. *running, 3840x2160 (model at 2560x1440)*. Lowering such a game's resolution
+     setting is therefore a real performance control.
 4. Keep ReShade's **Performance Mode** and **Skip Loading Disabled Effects** off. The bridge reads
    depth through a loaded effect that uses it; with either on, only enabled effects load.
 5. Check *Debug → Debug view → Motion vectors*: things that move show red and green.
