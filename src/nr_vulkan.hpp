@@ -542,13 +542,13 @@ inline void OnFrame(reshade::api::effect_runtime* runtime, reshade::api::command
   // A resize replaces the shared images; the queue must be done with the old ones first.
   if (v.color.tex12 != nullptr &&
       (v.color.w != bd.texture.width || v.color.h != bd.texture.height ||
-       v.depth.w != bd.texture.width || v.depth.h != bd.texture.height ||
+       v.depth.w != dd.texture.width || v.depth.h != dd.texture.height ||
        v.motion.w != md.texture.width || v.motion.h != md.texture.height))
     runtime->get_command_queue()->wait_idle();
   if (!EnsureShared(v.color, bd.texture.width, bd.texture.height, color_format, "colour") ||
       !EnsureShared(v.motion, md.texture.width, md.texture.height, motion_format, "motion") ||
-      !EnsureShared(v.depth, bd.texture.width, bd.texture.height, DXGI_FORMAT_R32_FLOAT, "depth") ||
-      !EnsureDepth32(dev, bd.texture.width, bd.texture.height))
+      !EnsureShared(v.depth, dd.texture.width, dd.texture.height, DXGI_FORMAT_R32_FLOAT, "depth") ||
+      !EnsureDepth32(dev, dd.texture.width, dd.texture.height))
     return;
 
   // In: depth converted on ReShade's API, then the three copies into the shared images.
@@ -563,7 +563,7 @@ inline void OnFrame(reshade::api::effect_runtime* runtime, reshade::api::command
                              descriptor_table_update{{}, 0, 0, 1,
                                                      descriptor_type::texture_unordered_access_view,
                                                      &v.depth32_uav});
-  cmd_list->dispatch((bd.texture.width + 7) / 8, (bd.texture.height + 7) / 8, 1);
+  cmd_list->dispatch((dd.texture.width + 7) / 8, (dd.texture.height + 7) / 8, 1);
   cmd_list->barrier(v.depth32, resource_usage::unordered_access, resource_usage::copy_source);
   cmd_list->barrier(back_buffer, resource_usage::render_target, resource_usage::copy_source);
   cmd_list->barrier(motion, resource_usage::shader_resource, resource_usage::copy_source);
