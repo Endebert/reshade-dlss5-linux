@@ -192,6 +192,10 @@ struct State {
   // evaluates for 3 s) keeps a standalone frame from running alongside an evaluate, which is a
   // timing argument rather than an enforced invariant.
   int dlss_resolution = 0;
+  // Render: the DLSS-SR color input's own size. A game with dynamic resolution allocates it at
+  // the largest render size and renders a subrect of it (High on Life: 1116x628 holding
+  // 1114x627), so the pass covers the whole texture and DLSS-SR still reads only its subrect.
+  unsigned color_in_w = 0, color_in_h = 0;
 
   // Where the frame comes from. Standalone runs off the back buffer, ReShade's depth and a
   // motion-vector effect, for a D3D12 game with no DLSS session to hook.
@@ -254,8 +258,12 @@ enum ModelResolution : int { kResFull = 0, kResRender = 1 };
 // which geometry. Standalone has no DLSS stage to insert in front of, so it always post-processes
 // the frame it was handed.
 inline bool PreSr() { return s.dlss_resolution == kResRender && s.source != kSrcStandalone; }
-inline unsigned PassW() { return PreSr() ? s.render_w : s.out_w; }
-inline unsigned PassH() { return PreSr() ? s.render_h : s.out_h; }
+inline unsigned PassW() {
+  return PreSr() ? (s.color_in_w != 0 ? s.color_in_w : s.render_w) : s.out_w;
+}
+inline unsigned PassH() {
+  return PreSr() ? (s.color_in_h != 0 ? s.color_in_h : s.render_h) : s.out_h;
+}
 
 inline const char* ResultName(int r) {
   switch ((unsigned)r) {
@@ -578,8 +586,15 @@ inline bool CreateTextures(ID3D12GraphicsCommandList* cmd, ID3D12Resource* game_
   // mid-frame) and writes it in place as a UAV (flagged below when absent). Retiring the
   // feature drops the textures, so a mode switch lands back here and is checked exactly when it
   // must be.
-  if (game_desc.Width != PassW() || game_desc.Height != PassH())
-    return GiveUp("the game frame does not match the pass geometry");
+  if (game_desc.Width != PassW() || game_desc.Height != PassH()) {
+    // Skipped, not given up on: the next frame or a model resolution switch may well match.
+    static bool said = false;
+    if (!said)
+      ngx_probe::Logf("nr-fwd: skipping -- the game frame is %llux%u, the pass %ux%u",
+                      (unsigned long long)game_desc.Width, game_desc.Height, PassW(), PassH());
+    said = true;
+    return false;
+  }
   if (PreSr() && (game_desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) == 0) {
     // NGX does not promise the flag on a color *input*, but this addon only ever runs on
     // vkd3d-proton, where the write lands regardless -- Control's input buffer is exactly such
@@ -1064,10 +1079,20 @@ inline bool WantPrePass() { return PreSr(); }
 // Model resolution Render: the frame is the DLSS-SR color input at render resolution, enhanced
 // in place, so the game's DLSS-SR then upscales the enhanced frame.
 inline void PreDlssEvaluate(ID3D12GraphicsCommandList* cmd, const NVSDK_NGX_Parameter* game_params) {
+  ID3D12Resource* color_in = nullptr;
+  if (game_params != nullptr) game_params->Get(NVSDK_NGX_Parameter_Color, &color_in);
+  if (color_in != nullptr) {
+    const D3D12_RESOURCE_DESC cd = color_in->GetDesc();
+    if (cd.Width != s.color_in_w || cd.Height != s.color_in_h) {
+      s.color_in_w = (unsigned)cd.Width;
+      s.color_in_h = cd.Height;
+      if (s.feature != nullptr && PreSr()) RetireFeature("DLSS-SR color input changed size");
+    }
+  }
   if (!PreparePass(cmd, game_params)) return;
 
   Inputs in;
-  game_params->Get(NVSDK_NGX_Parameter_Color, &in.color);
+  in.color = color_in;
   // Auto's encode decision keys off the DLSS-SR output, fetched here because this mode's frame
   // is the color input; the output resource is always in the game's parameter block.
   ID3D12Resource* dlss_output = nullptr;
