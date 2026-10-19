@@ -289,6 +289,10 @@ void LoadSettings() {
   reshade::get_config_value(nullptr, kConfigSection, "DirectNeuralRenderingEncoding", s.encoding);
   reshade::get_config_value(nullptr, kConfigSection, "DirectNeuralRenderingPassCount", s.pass_count);
   reshade::get_config_value(nullptr, kConfigSection, "StandaloneMode", s.standalone_mode);
+  int model_resolution = nr_runner::kResFull;
+  reshade::get_config_value(nullptr, kConfigSection, "ModelResolution", model_resolution);
+  if (model_resolution != nr_runner::kResRender) model_resolution = nr_runner::kResFull;
+  s.model_resolution.store(model_resolution, std::memory_order_relaxed);
   reshade::get_config_value(nullptr, kConfigSection, "DirectNeuralRenderingDiffuseWhiteNits",
                             s.diffuse_white_nits);
   reshade::get_config_value(nullptr, kConfigSection, "DirectNeuralRenderingDiffuseWhiteOverride",
@@ -335,6 +339,8 @@ void SaveSettings() {
   reshade::set_config_value(nullptr, kConfigSection, "DirectNeuralRenderingEncoding", s.encoding);
   reshade::set_config_value(nullptr, kConfigSection, "DirectNeuralRenderingPassCount", s.pass_count);
   reshade::set_config_value(nullptr, kConfigSection, "StandaloneMode", s.standalone_mode);
+  reshade::set_config_value(nullptr, kConfigSection, "ModelResolution",
+                            s.model_resolution.load(std::memory_order_relaxed));
   reshade::set_config_value(nullptr, kConfigSection, "DirectNeuralRenderingDiffuseWhiteNits",
                             s.diffuse_white_nits);
   reshade::set_config_value(nullptr, kConfigSection, "DirectNeuralRenderingDiffuseWhiteOverride",
@@ -454,6 +460,16 @@ void OnDrawOverlay(reshade::api::effect_runtime*) {
   }
 
   if (ImGui::CollapsingHeader("Neural Rendering", ImGuiTreeNodeFlags_DefaultOpen)) {
+    int model_resolution = s.model_resolution.load(std::memory_order_relaxed);
+    const Edit res = Combo(
+        "Model resolution", &model_resolution, "Full - best quality\0Render - faster\0", 0,
+        "Full runs the model on the full-resolution frame.\n"
+        "Render runs it at the resolution the game renders its scene at, where that is lower: "
+        "much cheaper, at some loss of fine detail. In standalone this applies when the depth "
+        "buffer is smaller than the screen (a game with a separate resolution or render scale "
+        "setting); only the model's change is scaled up, so the UI stays sharp.");
+    if (res.changed) s.model_resolution.store(model_resolution, std::memory_order_relaxed);
+    bridge |= res;  // the frame path rebuilds at the new size itself
     if (s.style > 2) s.style = 2;
     model |= Combo("Style", &s.style, "Model A\0Model B\0Model C\0", 0,
                    "Selects Neural Rendering Model A, Model B, or Model C through the prerelease "

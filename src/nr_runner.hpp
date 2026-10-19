@@ -194,11 +194,15 @@ struct State {
   // Reduced resolution: when depth is smaller than the screen (a game that renders its scene
   // below the output resolution), the model runs at depth's size. sa_frame is then that size;
   // these carry the rest.
+  // Model resolution, the user's choice (kResFull / kResRender). The overlay writes it; the frame
+  // paths read it.
+  std::atomic<int> model_resolution{0};
   bool sa_reduced = false;
   ID3D12Resource* sa_given = nullptr;  // the downscaled frame as the model was given it
   ID3D12Resource* sa_delta = nullptr;  // the model's change, RGBA16F
   ID3D12Resource* sa_mv = nullptr;     // motion vectors at the model's size
   ID3D12Resource* sa_full = nullptr;   // the full-resolution result
+  ID3D12Resource* sa_depth = nullptr;  // depth scaled up to the screen (Full, smaller depth)
   DXGI_FORMAT sa_format = DXGI_FORMAT_UNKNOWN;
   HMODULE ngx_core = nullptr;      // _nvngx.dll, when standalone had to start NGX itself
   // Standalone records on its own command list, made from ReShade's proxy device (the device
@@ -233,6 +237,9 @@ inline State s;
 
 enum Source : int { kSrcNone = 0, kSrcDlss = 1, kSrcStandalone = 2 };
 enum StandaloneMode : int { kSaAuto = 0, kSaAlways = 1, kSaOff = 2 };
+// Model resolution: Full runs the model on the full-resolution frame; Render at the resolution
+// the game renders its scene at, where that is lower (cheaper; see each frame path).
+enum ModelResolution : int { kResFull = 0, kResRender = 1 };
 
 inline const char* ResultName(int r) {
   switch ((unsigned)r) {
@@ -446,7 +453,7 @@ inline void Shutdown() {
   s.proxy = nullptr;
   if (s.sa_frame != nullptr) s.sa_frame->Release();
   s.sa_frame = nullptr;
-  for (ID3D12Resource** r : {&s.sa_given, &s.sa_delta, &s.sa_mv, &s.sa_full}) {
+  for (ID3D12Resource** r : {&s.sa_given, &s.sa_delta, &s.sa_mv, &s.sa_full, &s.sa_depth}) {
     if (*r != nullptr) (*r)->Release();
     *r = nullptr;
   }
@@ -1028,20 +1035,22 @@ inline ID3D12Resource* MakeUavTexture(ID3D12Device* device, UINT w, UINT h, DXGI
 }
 
 // The textures the pass works on: sa_frame at the model's size (work_w x work_h), plus, when that
-// is below the back buffer's size, the reduced-resolution set.
+// is below the back buffer's size, the reduced-resolution set, or, when depth has to be scaled up
+// to it, sa_depth.
 inline bool EnsureStandaloneFrame(ID3D12GraphicsCommandList* cmd, ID3D12Resource* back_buffer,
-                                  UINT work_w, UINT work_h) {
+                                  UINT work_w, UINT work_h, bool depth_up) {
   const D3D12_RESOURCE_DESC bb = back_buffer->GetDesc();
   const DXGI_FORMAT format = UavTwin(bb.Format);
   const bool reduced = work_w != (UINT)bb.Width || work_h != bb.Height;
   if (s.sa_frame != nullptr && s.sa_format == format && s.out_w == work_w && s.out_h == work_h &&
-      s.sa_reduced == reduced &&
+      s.sa_reduced == reduced && (s.sa_depth != nullptr) == depth_up &&
       (!reduced || (s.sa_full != nullptr && s.sa_full->GetDesc().Width == bb.Width &&
                     s.sa_full->GetDesc().Height == bb.Height)))
     return true;
   if (s.feature != nullptr) RetireFeature("standalone frame changed size or format");
   const bool idle = StandaloneIdle(2000);
-  for (ID3D12Resource** r : {&s.sa_frame, &s.sa_given, &s.sa_delta, &s.sa_mv, &s.sa_full}) {
+  for (ID3D12Resource** r :
+       {&s.sa_frame, &s.sa_given, &s.sa_delta, &s.sa_mv, &s.sa_full, &s.sa_depth}) {
     if (*r != nullptr) Drop(*r, nullptr, idle);
     *r = nullptr;
   }
@@ -1059,12 +1068,15 @@ inline bool EnsureStandaloneFrame(ID3D12GraphicsCommandList* cmd, ID3D12Resource
          (s.sa_mv = MakeUavTexture(device, work_w, work_h, DXGI_FORMAT_R16G16_FLOAT)) != nullptr &&
          (s.sa_full = MakeUavTexture(device, (UINT)bb.Width, bb.Height, format)) != nullptr;
   }
+  if (ok && depth_up)
+    ok = (s.sa_depth = MakeUavTexture(device, work_w, work_h, DXGI_FORMAT_R32_FLOAT)) != nullptr;
   device->Release();
   if (!ok) return false;
   s.sa_format = format;
   ngx_probe::Logf("nr-fwd: standalone frame %ux%u format=%u (back buffer %llux%u format %u)%s",
                   s.out_w, s.out_h, (unsigned)format, (unsigned long long)bb.Width, bb.Height,
-                  (unsigned)bb.Format, reduced ? ", reduced resolution" : "");
+                  (unsigned)bb.Format,
+                  reduced ? ", model at render resolution" : depth_up ? ", depth scaled up" : "");
   return true;
 }
 
@@ -1187,7 +1199,8 @@ inline bool OnStandaloneFrame(ID3D12Resource* back_buffer, ID3D12Resource* depth
   const D3D12_RESOURCE_DESC bb = back_buffer->GetDesc();
   const D3D12_RESOURCE_DESC dd = depth->GetDesc();
   // Depth smaller than the screen at the same aspect ratio: the game renders its scene below the
-  // output resolution, and the model runs at the scene's resolution (reduced mode).
+  // output resolution. Model resolution Render runs the model at the scene's resolution (reduced
+  // mode); Full scales depth up to the screen instead.
   const double aspect_error =
       (double)dd.Width * bb.Height - (double)dd.Height * (double)bb.Width;
   const bool same_aspect =
@@ -1231,13 +1244,27 @@ inline bool OnStandaloneFrame(ID3D12Resource* back_buffer, ID3D12Resource* depth
   s.sa_pending = true;  // from here on the list is submitted, even if the pass bails out
 
   if (!EnsureNgxCore(cmd)) return true;
-  if (!EnsureStandaloneFrame(cmd, back_buffer, (UINT)dd.Width, dd.Height)) return true;
+  const bool smaller = dd.Width != bb.Width || dd.Height != bb.Height;
+  const bool render_res = smaller && s.model_resolution.load(std::memory_order_relaxed) == kResRender;
+  const bool depth_up = smaller && !render_res;
+  if (!EnsureStandaloneFrame(cmd, back_buffer, render_res ? (UINT)dd.Width : (UINT)bb.Width,
+                             render_res ? dd.Height : bb.Height, depth_up))
+    return true;
   if (!EnsureSetup(cmd)) return true;
   if (!EnsureFeature(cmd)) return true;  // created this frame; it recorded init work
 
   using nr_compose::Barrier;
   const UINT full_w = (UINT)bb.Width, full_h = bb.Height;
   const uint32_t frame = (uint32_t)s.sa_value;
+  constexpr D3D12_RESOURCE_STATES kGuide =
+      D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+  if (s.sa_depth != nullptr) {
+    // Full with a smaller depth buffer: depth up to the screen, the rest as usual.
+    nr_compose::ScalePass(cmd, nr_compose::kScaleDepth, depth, depth, s.sa_depth, full_w, full_h,
+                          frame);
+    Barrier(cmd, s.sa_depth, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, kGuide);
+    depth = s.sa_depth;
+  }
   if (s.sa_reduced) {
     // Back buffer -> the model's size, kept aside as given; motion vectors to the same grid.
     Barrier(cmd, back_buffer, bb_state, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
@@ -1275,6 +1302,8 @@ inline bool OnStandaloneFrame(ID3D12Resource* back_buffer, ID3D12Resource* depth
   if (depth_scale_x > 1.0f) in.depth_w = (unsigned)((float)s.out_w / depth_scale_x + 0.5f);
   if (depth_scale_y > 1.0f) in.depth_h = (unsigned)((float)s.out_h / depth_scale_y + 0.5f);
   Evaluate(cmd, in);
+  if (s.sa_depth != nullptr)
+    Barrier(cmd, s.sa_depth, kGuide, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 
   if (s.sa_reduced) {
     // The model's change, scaled up onto the full-resolution frame.

@@ -32,11 +32,12 @@
 #include "../build/shaders/nr_delta_dxil.h"
 #include "../build/shaders/nr_mv_down_dxil.h"
 #include "../build/shaders/nr_up_dxil.h"
+#include "../build/shaders/nr_depth_up_dxil.h"
 
 namespace nr_compose {
 
 constexpr uint32_t kRingSize = 8;        // frames of descriptor tables in flight
-constexpr uint32_t kSlotsPerFrame = 24;  // see the slot map in RecordPre/RecordPost
+constexpr uint32_t kSlotsPerFrame = 27;  // see the slot map in RecordPre/RecordPost
 constexpr uint32_t kReadbackRing = 4;    // frames the measurement is allowed to lag
 
 struct Compose {
@@ -50,6 +51,7 @@ struct Compose {
   ID3D12PipelineState* delta_pso = nullptr;
   ID3D12PipelineState* mv_down_pso = nullptr;
   ID3D12PipelineState* up_pso = nullptr;
+  ID3D12PipelineState* depth_up_pso = nullptr;
   ID3D12DescriptorHeap* heap = nullptr;
   uint32_t descriptor_size = 0;
 
@@ -71,7 +73,8 @@ inline void Release() {
   if (c.tile_buf != nullptr) c.tile_buf->Release();
   if (c.heap != nullptr) c.heap->Release();
   if (c.lum2_pso != nullptr) c.lum2_pso->Release();
-  for (ID3D12PipelineState* pso : {c.down_pso, c.delta_pso, c.mv_down_pso, c.up_pso})
+  for (ID3D12PipelineState* pso :
+       {c.down_pso, c.delta_pso, c.mv_down_pso, c.up_pso, c.depth_up_pso})
     if (pso != nullptr) pso->Release();
   if (c.lum1_pso != nullptr) c.lum1_pso->Release();
   if (c.encode_pso != nullptr) c.encode_pso->Release();
@@ -164,7 +167,8 @@ inline bool Init(ID3D12Device* device) {
       !MakePso(device, nr_down_dxil, sizeof(nr_down_dxil), &c.down_pso) ||
       !MakePso(device, nr_delta_dxil, sizeof(nr_delta_dxil), &c.delta_pso) ||
       !MakePso(device, nr_mv_down_dxil, sizeof(nr_mv_down_dxil), &c.mv_down_pso) ||
-      !MakePso(device, nr_up_dxil, sizeof(nr_up_dxil), &c.up_pso)) {
+      !MakePso(device, nr_up_dxil, sizeof(nr_up_dxil), &c.up_pso) ||
+      !MakePso(device, nr_depth_up_dxil, sizeof(nr_depth_up_dxil), &c.depth_up_pso)) {
     c.failed = true;
     return false;
   }
@@ -350,7 +354,7 @@ inline void Dispatch(ID3D12GraphicsCommandList* cmd, ID3D12PipelineState* pso, u
 //   6    UAV game output       (resolve)
 //   7-8  SRV tile_buf x2       (lum2 t0-t1)
 //   9    UAV result_buf        (lum2)
-//   12-23 reduced-resolution standalone, three per pass (ScalePass)
+//   12-26 standalone resolution passes, three per pass (ScalePass)
 //
 // Persistent states between frames: colorCopy, proxy, modelOut, tile_buf, result_buf all
 // UNORDERED_ACCESS; the game's output is in UNORDERED_ACCESS around DLSS evaluation.
@@ -451,9 +455,9 @@ inline void RecordPost(ID3D12GraphicsCommandList* cmd, ID3D12Resource* game_out,
   device->Release();
 }
 
-// One pass of reduced-resolution standalone: t0, t1 -> u0 at w x h, on descriptor slots
+// One standalone resolution pass: t0, t1 -> u0 at w x h, on descriptor slots
 // slot..slot+2 of ring frame `frame`. The caller owns every resource state.
-enum ScaleKind { kScaleDown = 0, kScaleMotion = 1, kScaleDelta = 2, kScaleUp = 3 };
+enum ScaleKind { kScaleDown = 0, kScaleMotion = 1, kScaleDelta = 2, kScaleUp = 3, kScaleDepth = 4 };
 inline bool ScalePass(ID3D12GraphicsCommandList* cmd, ScaleKind kind, ID3D12Resource* t0,
                       ID3D12Resource* t1, ID3D12Resource* u0, uint32_t w, uint32_t h,
                       uint32_t frame, DXGI_FORMAT t0_format = DXGI_FORMAT_UNKNOWN) {
@@ -464,16 +468,17 @@ inline bool ScalePass(ID3D12GraphicsCommandList* cmd, ScaleKind kind, ID3D12Reso
     return false;
   }
   const uint32_t base = (frame % kRingSize) * kSlotsPerFrame + 12 + 3 * (uint32_t)kind;
-  if (kind == kScaleMotion) {
-    WriteMotionSrv(device, base + 0, t0);
-    WriteMotionSrv(device, base + 1, t1);
+  if (kind == kScaleMotion || kind == kScaleDepth) {
+    WriteMotionSrv(device, base + 0, t0, kind == kScaleDepth);
+    WriteMotionSrv(device, base + 1, t1, kind == kScaleDepth);
   } else {
     WriteSrv(device, base + 0, t0, t0_format);
     WriteSrv(device, base + 1, t1, t0 == t1 ? t0_format : DXGI_FORMAT_UNKNOWN);
   }
   WriteUav(device, base + 2, u0);
   device->Release();
-  ID3D12PipelineState* const psos[] = {c.down_pso, c.mv_down_pso, c.delta_pso, c.up_pso};
+  ID3D12PipelineState* const psos[] = {c.down_pso, c.mv_down_pso, c.delta_pso, c.up_pso,
+                                       c.depth_up_pso};
   Params p = {};
   p.width = w;
   p.height = h;

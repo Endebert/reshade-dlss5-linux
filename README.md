@@ -57,6 +57,7 @@ starts DLSS of its own), *Always*, or *Off*. Its status line says what it is wai
 
 | Setting | Parameter | Notes |
 |---|---|---|
+| Model resolution | `ModelResolution` | *Full* (default) runs the model on the full-resolution frame. *Render* runs it at the resolution the game renders its scene at, where that is lower: much cheaper, at some loss of fine detail. In standalone it applies when the depth buffer is smaller than the screen (see [Depth and motion vectors](#depth-and-motion-vectors)). |
 | Style | `DLSSNR.Style` | Model A, B or C. They look distinctly different. |
 | Overall Intensity | `DLSSNR.Intensity` | 0–1. The model caps it at 1. |
 | Structure Intensity | `DLSSNR.LocalStructureStrength` | Fine detail the model synthesises. |
@@ -276,11 +277,12 @@ session fed approximated inputs, so text can soften and dense foliage can smear 
    standalone).
    - **Depth buffer smaller than the screen?** Some games render the scene into their own smaller
      buffers and draw the UI at full size; Detroit: Become Human keeps a desktop-sized swapchain
-     whatever its resolution setting. Standalone then runs the model at the depth buffer's
-     resolution and adds only the model's change, scaled up, onto the full-resolution frame: the
-     UI stays sharp and the model costs what it would at the lower resolution. The status line
-     reads e.g. *running, 3840x2160 (model at 2560x1440)*. Lowering such a game's resolution
-     setting is therefore a real performance control.
+     whatever its resolution setting. With **Model resolution → Render**, standalone runs the model
+     at the depth buffer's resolution and adds only the model's change, scaled up, onto the
+     full-resolution frame: the UI stays sharp and the model costs what it would at the lower
+     resolution. The status line reads e.g. *running, 3840x2160 (model at 2560x1440)*, and
+     lowering such a game's resolution setting becomes a real performance control. With *Full*,
+     depth is scaled up to the screen and the model runs on the full frame.
 4. Keep ReShade's **Performance Mode** and **Skip Loading Disabled Effects** off. The bridge reads
    depth through a loaded effect that uses it; with either on, only enabled effects load.
 5. Check *Debug → Debug view → Motion vectors*: things that move show red and green.
