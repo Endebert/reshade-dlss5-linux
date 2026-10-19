@@ -279,7 +279,7 @@ inline NVSDK_NGX_Result NVSDK_CONV HookD3D12EvaluateFeature(
   // none of its semantics. Before the first SR create has been seen (sr_handle null) every
   // evaluate counts, and the pass stays out anyway behind the no-DLSS-session gate.
   const bool sr = sr_handle == nullptr || handle == sr_handle;
-  // Insertion point Render: enhance the color input before the game's DLSS-SR upscales it, on
+  // Model resolution Render: enhance the color input before the game's DLSS-SR upscales it, on
   // this same command list, so recording order is the execution order. Upscaled runs the pass
   // after the evaluate instead, on the success path below.
   const bool pre = sr && nr_runner::WantPrePass();

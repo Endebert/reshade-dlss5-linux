@@ -33,7 +33,7 @@ vtables and by-value aggregate returns match MSVC-built ReShade.
 1. Finds a frame to work on:
    - **A DLSS session.** Hooks the game's NGX `CreateFeature` / `EvaluateFeature` (via Microsoft
      Detours) and, around each DLSS-SR evaluate, takes the frame -- its color input before the
-     upscale or its output after it, per *Insertion point* -- plus depth and motion vectors.
+     upscale or its output after it, per *Model resolution* -- plus depth and motion vectors.
      This is how native DLSS games and games through dlss5-bridge run.
    - **Standalone.** In a game without DLSS (D3D12, D3D11 or Vulkan), takes the back buffer, ReShade's depth and
      iMMERSE Launchpad's motion vectors right after Launchpad runs, and starts NGX itself.
@@ -59,7 +59,7 @@ starts DLSS of its own), *Always*, or *Off*. Its status line says what it is wai
 
 | Setting | Parameter | Notes |
 |---|---|---|
-| Insertion point | `InsertionPoint` | *Upscaled* (default) runs the pass on the game's DLSS-SR output after it upscales, so the game's post-processing consumes the enhanced frame (RenoDX's *Upscaled/Present*). *Render* runs it on the render-resolution color input before the upscale, so DLSS-SR then upscales the enhanced frame (RenoDX's *Render*): cheaper, and stabilized by SR's temporal filter, but SR smooths the structure the model synthesized. DLSS-session source only; switching rebuilds the feature at the new geometry. |
+| Model resolution | `ModelResolution` | *Full* (default) runs the model on the full-resolution frame. *Render* runs it at the resolution the game renders its scene at, where that is lower: much cheaper, at some loss of fine detail. In a game with DLSS, *Render* runs the model on the frame before DLSS-SR upscales it, at your DLSS preset's render resolution; DLSS-SR then upscales the enhanced frame and smooths some of the detail the model adds (RenoDX's *Render* hook; *Full* is its *Upscaled/Present*). In standalone it applies when the depth buffer is smaller than the screen (see [Depth and motion vectors](#depth-and-motion-vectors)). |
 | Style | `DLSSNR.Style` | Model A, B or C. They look distinctly different. |
 | Overall Intensity | `DLSSNR.Intensity` | 0–1. The model caps it at 1. |
 | Structure Intensity | `DLSSNR.LocalStructureStrength` | Fine detail the model synthesises. |
@@ -279,11 +279,12 @@ session fed approximated inputs, so text can soften and dense foliage can smear 
    standalone).
    - **Depth buffer smaller than the screen?** Some games render the scene into their own smaller
      buffers and draw the UI at full size; Detroit: Become Human keeps a desktop-sized swapchain
-     whatever its resolution setting. Standalone then runs the model at the depth buffer's
-     resolution and adds only the model's change, scaled up, onto the full-resolution frame: the
-     UI stays sharp and the model costs what it would at the lower resolution. The status line
-     reads e.g. *running, 3840x2160 (model at 2560x1440)*. Lowering such a game's resolution
-     setting is therefore a real performance control.
+     whatever its resolution setting. With **Model resolution → Render**, standalone runs the model
+     at the depth buffer's resolution and adds only the model's change, scaled up, onto the
+     full-resolution frame: the UI stays sharp and the model costs what it would at the lower
+     resolution. The status line reads e.g. *running, 3840x2160 (model at 2560x1440)*, and
+     lowering such a game's resolution setting becomes a real performance control. With *Full*,
+     depth is scaled up to the screen and the model runs on the full frame.
 4. Keep ReShade's **Performance Mode** and **Skip Loading Disabled Effects** off. The bridge reads
    depth through a loaded effect that uses it; with either on, only enabled effects load.
 5. Check *Debug → Debug view → Motion vectors*: things that move show red and green.

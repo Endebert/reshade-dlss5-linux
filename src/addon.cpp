@@ -289,6 +289,12 @@ void LoadSettings() {
   reshade::get_config_value(nullptr, kConfigSection, "DirectNeuralRenderingEncoding", s.encoding);
   reshade::get_config_value(nullptr, kConfigSection, "DirectNeuralRenderingPassCount", s.pass_count);
   reshade::get_config_value(nullptr, kConfigSection, "StandaloneMode", s.standalone_mode);
+  int model_resolution = nr_runner::kResFull;
+  reshade::get_config_value(nullptr, kConfigSection, "ModelResolution", model_resolution);
+  if (model_resolution != nr_runner::kResRender) model_resolution = nr_runner::kResFull;
+  s.model_resolution.store(model_resolution, std::memory_order_relaxed);
+  // Attach time: no evaluate has run yet, so the active mode can take the loaded value directly.
+  s.dlss_resolution = model_resolution;
   reshade::get_config_value(nullptr, kConfigSection, "DirectNeuralRenderingDiffuseWhiteNits",
                             s.diffuse_white_nits);
   reshade::get_config_value(nullptr, kConfigSection, "DirectNeuralRenderingDiffuseWhiteOverride",
@@ -310,7 +316,6 @@ void LoadSettings() {
   reshade::get_config_value(nullptr, kConfigSection, "DetailStrength", s.transfer);
   reshade::get_config_value(nullptr, kConfigSection, "ColourStrength", s.colour_strength);
   reshade::get_config_value(nullptr, kConfigSection, "WhitePointScale", s.wp_scale);
-  reshade::get_config_value(nullptr, kConfigSection, "InsertionPoint", s.insertion);
 
   // A hand-edited ini must not push values past what the model or the compose pass tolerate.
   // Intensities are forwarded unvalidated beyond the slider range, as in RenoDX, but not negative.
@@ -329,9 +334,6 @@ void LoadSettings() {
   if (s.pass_count < 1 || s.pass_count > nr_runner::kMaxPasses) s.pass_count = 1;
   if (s.standalone_mode < 0 || s.standalone_mode > nr_runner::kSaOff) s.standalone_mode = 0;
   if (s.style < 0 || s.style > 2) s.style = 0;
-  if (s.insertion < 0 || s.insertion > nr_runner::kInsRender) s.insertion = nr_runner::kInsUpscaled;
-  // Attach time: no evaluate has run yet, so the active mode can take the loaded value directly.
-  s.insertion_pending.store(s.insertion, std::memory_order_relaxed);
 }
 
 void SaveSettings() {
@@ -339,8 +341,8 @@ void SaveSettings() {
   reshade::set_config_value(nullptr, kConfigSection, "DirectNeuralRenderingEncoding", s.encoding);
   reshade::set_config_value(nullptr, kConfigSection, "DirectNeuralRenderingPassCount", s.pass_count);
   reshade::set_config_value(nullptr, kConfigSection, "StandaloneMode", s.standalone_mode);
-  reshade::set_config_value(nullptr, kConfigSection, "InsertionPoint",
-                            s.insertion_pending.load(std::memory_order_relaxed));
+  reshade::set_config_value(nullptr, kConfigSection, "ModelResolution",
+                            s.model_resolution.load(std::memory_order_relaxed));
   reshade::set_config_value(nullptr, kConfigSection, "DirectNeuralRenderingDiffuseWhiteNits",
                             s.diffuse_white_nits);
   reshade::set_config_value(nullptr, kConfigSection, "DirectNeuralRenderingDiffuseWhiteOverride",
@@ -461,24 +463,19 @@ void OnDrawOverlay(reshade::api::effect_runtime*) {
   }
 
   if (ImGui::CollapsingHeader("Neural Rendering", ImGuiTreeNodeFlags_DefaultOpen)) {
-    // Written as the pending value: the evaluate thread swaps it in together with the rebuild
-    // the new geometry needs, so the mode cannot flip mid-frame.
-    int insertion = s.insertion_pending.load(std::memory_order_relaxed);
-    ImGui::BeginDisabled(s.source == nr_runner::kSrcStandalone);
-    const Edit ins = Combo(
-        "Insertion point (DLSS only)", &insertion,
-        "Upscaled (after DLSS-SR)\0Render (before DLSS-SR)\0", 0,
-        "DLSS-session games only: grayed out in standalone, where the game has no DLSS-SR stage "
-        "to insert in front of. Upscaled (RenoDX's Upscaled/Present) runs it on the upscaled "
-        "frame, and the game's post-processing consumes the enhanced result. Render (RenoDX's "
-        "Render) runs it on the render-resolution color input before the upscale, so DLSS-SR "
-        "then upscales the enhanced frame: cheaper, and stabilized by SR's temporal filter, but "
-        "SR smooths the structure the model synthesized.");
-    ImGui::EndDisabled();
-    if (ins.changed) s.insertion_pending.store(insertion, std::memory_order_relaxed);
-    // Config-only bucket: the mode swap in PreparePass retires the feature itself, so it can
-    // log its own reason instead of "model settings changed".
-    bridge |= ins;
+    int model_resolution = s.model_resolution.load(std::memory_order_relaxed);
+    const Edit res = Combo(
+        "Model resolution", &model_resolution, "Full - best quality\0Render - faster\0", 0,
+        "Full runs the model on the full-resolution frame.\n"
+        "Render runs it at the resolution the game renders its scene at, where that is lower: "
+        "much cheaper, at some loss of fine detail.\n"
+        "In a game with DLSS: the frame before DLSS upscales it, at your DLSS preset's render "
+        "resolution; DLSS then smooths some of the detail the model adds.\n"
+        "In standalone: applies when the depth buffer is smaller than the screen (a game with a "
+        "separate resolution or render scale setting); only the model's change is scaled up, so "
+        "the UI stays sharp.");
+    if (res.changed) s.model_resolution.store(model_resolution, std::memory_order_relaxed);
+    bridge |= res;  // the frame path rebuilds at the new size itself
     if (s.style > 2) s.style = 2;
     model |= Combo("Style", &s.style, "Model A\0Model B\0Model C\0", 0,
                    "Selects Neural Rendering Model A, Model B, or Model C through the prerelease "
