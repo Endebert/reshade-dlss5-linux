@@ -355,13 +355,6 @@ which identifies the model build you were running.
 > ini section are NapXDD's, kept so this drops in over an addon-dlssnr-linux install; old
 > settings are migrated.
 
-This fork:
-
-- **Rian Goossens** (<https://github.com/RianGoossens>): standalone mode for D3D12, D3D11 and
-  Vulkan games, the D3D11 and Vulkan transports, Model resolution, and maintenance.
-- **Endebert** (<https://github.com/Endebert>): *Model resolution → Render* in games with DLSS
-  ([#2](https://github.com/RianGoossens/reshade-dlss5-linux/pull/2)).
-
 This project was studied from, and stands on, the following work. Please support the originals.
 
 - **addon-dlssnr-linux** by NapXDD (<https://github.com/NapXDD/addon-dlssnr-linux>) — GPL-3.0.
