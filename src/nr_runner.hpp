@@ -123,6 +123,12 @@ enum Encoding : int {
   kEncLegacyMeasured = 6,
 };
 
+// Measured exposes like classic auto-exposure (Reinhard et al. 2002): the frame's log-average
+// lands at this fraction of white, i.e. white = average / key, so the average reads as mid-grey
+// under either curve. Without it the average itself would be white, and Knee, which caps near 2x
+// white, would clip much of an ordinary frame.
+constexpr float kMeasuredKey = 0.18f;
+
 // What the encode divides by.
 enum WhitePointSource : int {
   kWpFixed = 0,     // DiffuseWhiteToSource(encoding, nits): a constant
@@ -950,13 +956,12 @@ inline void Evaluate(ID3D12GraphicsCommandList* cmd, const Inputs& in) {
     // 6x within one session -- so no constant can track it; the frame's own average can.
     // The floor matches SourceToRel's own 1e-4 guard: an older 0.01 floor silently doubled
     // the white point in dark scenes, where this buffer's average sits near 0.005.
-    float wp = (s.wp_ema > 0.0f) ? s.wp_ema : fixed_wp;
+    float wp = (s.wp_ema > 0.0f) ? s.wp_ema / kMeasuredKey : fixed_wp;
     bridge.white_point = (wp < 1e-4f ? 1e-4f : (wp > 1000.0f ? 1000.0f : wp)) * s.wp_scale;
   } else {
-    // The same multiplier as above, so toggling Measured changes only the source. Redundant
-    // with the nits slider's own range, but that redundancy is the point: the scale stays put
-    // across the toggle.
-    bridge.white_point = fixed_wp * s.wp_scale;
+    // White point scale is Measured's own: a fixed white point already has Diffuse White (nits),
+    // and a scale left over from a Measured session must not move the fixed picture unseen.
+    bridge.white_point = fixed_wp;
   }
   s.active_encoding = encoding;
   s.active_white_point = bridge.white_point;

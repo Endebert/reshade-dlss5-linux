@@ -83,14 +83,16 @@ preset resolves to the same model.
 
 Three independent choices. They used to be one bundled mode, which meant a buffer whose scale
 moves with the scene could only ever be right in one of them. Configs saved with that old mode
-(`Encoding=6`) are migrated on first load to *Auto* + *Measured* + *Reinhard* — the same picture
-as before, except a UNORM game gains the sRGB decode it should have had all along.
+(`Encoding=6`) are migrated on first load to *Auto* + *Measured* + *Reinhard*. The model is then
+shown a darker frame than the old mode did, because *Measured* now exposes the average as
+mid-grey instead of as white, and a UNORM game gains the sRGB decode it should have had all
+along.
 
 | Setting | Notes |
 |---|---|
 | Encoding | How to decode the buffer to linear. *Auto* picks linear BT.709 for native DLSS output (float formats) and sRGB for 8/10-bit UNORM output, such as a D3D11 game through [dlss5-bridge](https://github.com/NIGos/dlss5-bridge). Independent of the two settings below: changing it leaves them alone, so an A/B across encodings compares the encoding. |
-| Diffuse White (nits) + *Measured* | What the encode divides by. The slider sets a constant; the *Measured* checkbox beside it swaps the source for the frame's own average brightness, re-anchored every frame, and disables the slider. Measured is the only source that survives a scene-referred buffer, whose scale can swing several times within one session — a constant on such a buffer leaves the model looking at a near-black frame in dark areas, and its answer there is noise. The measurement runs either way, so the toggle is instant. Defaults as in RenoDX: 100 nits for linear and sRGB, 250 for PQ and scRGB, 203 for scRGB-nl. |
-| White point scale | Multiplier on the white point, applied to whichever source is active. It holds its value across the *Measured* toggle, so a comparison is about the source alone. |
+| Diffuse White (nits) + *Measured* | What the encode divides by. The slider sets a constant; the *Measured* checkbox beside it swaps the source for the frame's own average brightness, re-anchored every frame (white = average ÷ 0.18, the standard auto-exposure key, so the average reads as mid-grey under either curve), and disables the slider. Measured is the only source that survives a scene-referred buffer, whose scale can swing several times within one session — a constant on such a buffer leaves the model looking at a near-black frame in dark areas, and its answer there is noise. The measurement runs either way, so the toggle is instant. Defaults as in RenoDX: 100 nits for linear and sRGB, 250 for PQ and scRGB, 203 for scRGB-nl. |
+| White point scale | *Measured* only: a multiplier on the measured white point, for scenes auto-exposure gets wrong (mostly dark or mostly bright). |
 | Curve | How the frame is compressed for the model. *Knee* passes everything below 0.8× white through untouched and rolls off above, but represents only up to about 2× white — it assumes content already clamped to white, so scene-referred highlights pile up at its cap. *Reinhard* compresses smoothly everywhere and reaches about 450× white. |
 
 **Composition**

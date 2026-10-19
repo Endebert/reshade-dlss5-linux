@@ -334,8 +334,9 @@ void LoadSettings() {
   s.skin_structure = Clamp(s.skin_structure, 0.0f, 4.0f);
   // Pre-split value: Encoding 6 was "Measured (legacy)", which bundled a measured white point
   // and the Reinhard curve with a forced linear decode. Translate it into the three fields.
-  // Auto resolves to linear for the float formats that mode ran on, so the picture does not
-  // move; a UNORM game gains the sRGB decode it should have had all along.
+  // Auto resolves to linear for the float formats that mode ran on; a UNORM game gains the sRGB
+  // decode it should have had all along. Measured now exposes the average as mid-grey rather
+  // than as white (kMeasuredKey), so the migrated picture is darker than the old mode's.
   if (s.encoding == nr_runner::kEncLegacyMeasured) {
     s.encoding = nr_runner::kEncAuto;
     s.wp_source = nr_runner::kWpMeasured;
@@ -586,21 +587,22 @@ void OnDrawOverlay(reshade::api::effect_runtime*) {
       s.wp_source = measured ? nr_runner::kWpMeasured : nr_runner::kWpFixed;
       dw.changed = true;
     }
-    Tip("Measured divides by the frame's own average brightness, re-anchored every frame, and "
-        "disables Diffuse White above. It is the only source that survives a buffer whose scale "
+    Tip("Measured sets white from the frame's own average brightness, re-anchored every frame "
+        "(white = average / 0.18, the standard auto-exposure key, so the average reads as "
+        "mid-grey), and disables Diffuse White above. It is the only source that survives a buffer whose scale "
         "moves with the scene: a scene-referred game can swing several times within one session, "
         "and no constant tracks that, so the model is shown a near-black frame in dark areas and "
         "answers with noise.\nThe measurement runs either way, so switching it on is instant.");
     bridge |= dw;
 
-    bridge |= Slider("White point scale", &s.wp_scale, 0.1f, 4.0f, "%.2f", 1.0f,
-                     "Multiplier applied to the white point, whichever source it comes from: "
-                     "Diffuse White (nits) with Measured off, the frame's measured average with "
-                     "it on. It holds its value across the toggle, so an A/B is about the source "
-                     "and not about the scale as well.");
     if (measured) {
+      bridge |= Slider("White point scale", &s.wp_scale, 0.1f, 4.0f, "%.2f", 1.0f,
+                       "Multiplier on the measured white point: above 1 shows the model a darker "
+                       "frame, below 1 a brighter one. For scenes that auto-exposure gets wrong, "
+                       "such as mostly dark or mostly bright ones.");
       if (s.wp_ema > 0.0f) {
-        ImGui::Text("Measured white point: %.4f", s.wp_ema);
+        ImGui::Text("Measured white point: %.4f (frame average %.4f)",
+                    s.wp_ema / nr_runner::kMeasuredKey * s.wp_scale, s.wp_ema);
       } else {
         ImGui::TextUnformatted("Measured white point: (measuring...)");
       }
