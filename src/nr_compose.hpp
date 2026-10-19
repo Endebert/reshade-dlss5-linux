@@ -357,7 +357,9 @@ inline void Dispatch(ID3D12GraphicsCommandList* cmd, ID3D12PipelineState* pso, u
 //   12-26 standalone resolution passes, three per pass (ScalePass)
 //
 // Persistent states between frames: colorCopy, proxy, modelOut, tile_buf, result_buf all
-// UNORDERED_ACCESS; the game's output is in UNORDERED_ACCESS around DLSS evaluation.
+// UNORDERED_ACCESS. Around DLSS evaluation the frame itself sits UNORDERED_ACCESS on the
+// post-SR path (the game's output); the pre-SR path holds it NON_PIXEL_SHADER_RESOURCE for the
+// evaluate and transitions it only around this pass.
 
 // Copy the original aside, encode the proxy, and record the luminance measurement. Leaves:
 // game_out COPY_SOURCE, colorCopy and proxy NON_PIXEL_SHADER_RESOURCE (ready for the model).

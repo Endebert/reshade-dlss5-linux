@@ -32,13 +32,15 @@ vtables and by-value aggregate returns match MSVC-built ReShade.
 
 1. Finds a frame to work on:
    - **A DLSS session.** Hooks the game's NGX `CreateFeature` / `EvaluateFeature` (via Microsoft
-     Detours) and, after each DLSS-SR evaluate, takes its output, depth and motion vectors. This
-     is how native DLSS games and games through dlss5-bridge run.
+     Detours) and, around each DLSS-SR evaluate, takes the frame -- its color input before the
+     upscale or its output after it, per *Model resolution* -- plus depth and motion vectors.
+     This is how native DLSS games and games through dlss5-bridge run.
    - **Standalone.** In a game without DLSS (D3D12, D3D11 or Vulkan), takes the back buffer, ReShade's depth and
      iMMERSE Launchpad's motion vectors right after Launchpad runs, and starts NGX itself.
 2. Runs the DLSSNR model on that frame (once per pass) and composites its answer back. With DLSS
-   the game's own tone-mapping then consumes the enhanced frame; standalone writes it to the
-   back buffer.
+   the answer returns either before the game's own DLSS-SR upscale (which then scales the
+   enhanced frame) or after it, so the game's post-processing consumes the enhanced result;
+   standalone writes it to the back buffer.
 3. A colour bridge keeps the model, which was trained on display-referred data, from producing a
    veil, noise, or a colour cast. The frame is decoded from its encoding, normalised to diffuse
    white, and shown to the model display-referred. The model's answer is then anchored to the
@@ -57,7 +59,7 @@ starts DLSS of its own), *Always*, or *Off*. Its status line says what it is wai
 
 | Setting | Parameter | Notes |
 |---|---|---|
-| Model resolution | `ModelResolution` | *Full* (default) runs the model on the full-resolution frame. *Render* runs it at the resolution the game renders its scene at, where that is lower: much cheaper, at some loss of fine detail. In standalone it applies when the depth buffer is smaller than the screen (see [Depth and motion vectors](#depth-and-motion-vectors)). |
+| Model resolution | `ModelResolution` | *Full* (default) runs the model on the full-resolution frame. *Render* runs it at the resolution the game renders its scene at, where that is lower: much cheaper, at some loss of fine detail. In a game with DLSS, *Render* runs the model on the frame before DLSS-SR upscales it, at your DLSS preset's render resolution; DLSS-SR then upscales the enhanced frame and smooths some of the detail the model adds (RenoDX's *Render* hook; *Full* is its *Upscaled/Present*). In standalone it applies when the depth buffer is smaller than the screen (see [Depth and motion vectors](#depth-and-motion-vectors)). |
 | Style | `DLSSNR.Style` | Model A, B or C. They look distinctly different. |
 | Overall Intensity | `DLSSNR.Intensity` | 0–1. The model caps it at 1. |
 | Structure Intensity | `DLSSNR.LocalStructureStrength` | Fine detail the model synthesises. |
@@ -106,8 +108,8 @@ one needs.
 ### Prerequisites
 
 - An **RTX 50-series or RTX 40-series** GPU, with a recent NVIDIA driver branch that supports
-  DLSS Neural Rendering. The `nvngx_dlssnr.dll` model supports both generations; this add-on has
-  only been tested on RTX 50 so far, but is expected to work on RTX 40 — reports welcome.
+  DLSS Neural Rendering. The `nvngx_dlssnr.dll` model supports both generations; the add-on has
+  been tested on both — RTX 50-series in the original sessions, and an RTX 4090 running Control.
 - **Proton** with NVAPI/NGX enabled. In a game with DLSS, **turn DLSS (Super Resolution) on
   in-game**: the add-on runs off its output. Games without DLSS: see
   [Games without DLSS 5 support](#games-without-dlss-5-support).
@@ -122,7 +124,7 @@ one needs.
   version and SHA-256 to `ReShade.log` at startup (`nr-fwd: model nvngx_dlssnr.dll ...`); include
   that line when reporting a problem.
 
-Tested on RTX 50-series cards under Proton. The [Tested Games](https://github.com/RianGoossens/reshade-dlss5-linux/wiki/Tested-Games) wiki page lists the games
+Tested on RTX 50- and RTX 40-series cards under Proton. The [Tested Games](https://github.com/RianGoossens/reshade-dlss5-linux/wiki/Tested-Games) wiki page lists the games
 and setups confirmed working.
 
 > **First, make sure the game itself runs on Proton.** Check
