@@ -335,8 +335,7 @@ void LoadSettings() {
   // Pre-split value: Encoding 6 was "Measured (legacy)", which bundled a measured white point
   // and the Reinhard curve with a forced linear decode. Translate it into the three fields.
   // Auto resolves to linear for the float formats that mode ran on; a UNORM game gains the sRGB
-  // decode it should have had all along. Measured now exposes the average as mid-grey rather
-  // than as white (kMeasuredKey), so the migrated picture is darker than the old mode's.
+  // decode it should have had all along.
   if (s.encoding == nr_runner::kEncLegacyMeasured) {
     s.encoding = nr_runner::kEncAuto;
     s.wp_source = nr_runner::kWpMeasured;

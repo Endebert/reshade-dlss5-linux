@@ -83,10 +83,8 @@ preset resolves to the same model.
 
 Three independent choices. They used to be one bundled mode, which meant a buffer whose scale
 moves with the scene could only ever be right in one of them. Configs saved with that old mode
-(`Encoding=6`) are migrated on first load to *Auto* + *Measured* + *Reinhard*. The model is then
-shown a darker frame than the old mode did, because *Measured* now exposes the average as
-mid-grey instead of as white, and a UNORM game gains the sRGB decode it should have had all
-along.
+(`Encoding=6`) are migrated on first load to *Auto* + *Measured* + *Reinhard*; a UNORM game gains
+the sRGB decode it should have had all along.
 
 | Setting | Notes |
 |---|---|
