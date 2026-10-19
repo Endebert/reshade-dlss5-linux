@@ -80,7 +80,9 @@ preset resolves to the same model.
 **Colour bridge**
 
 Three independent choices. They used to be one bundled mode, which meant a buffer whose scale
-moves with the scene could only ever be right in one of them.
+moves with the scene could only ever be right in one of them. Configs saved with that old mode
+(`Encoding=6`) are migrated on first load to *Auto* + *Measured* + *Reinhard* — the same picture
+as before, except a UNORM game gains the sRGB decode it should have had all along.
 
 | Setting | Notes |
 |---|---|

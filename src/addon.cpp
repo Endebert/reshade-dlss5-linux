@@ -340,6 +340,13 @@ void LoadSettings() {
     s.encoding = nr_runner::kEncAuto;
     s.wp_source = nr_runner::kWpMeasured;
     s.curve = nr_runner::kCurveReinhard;
+    // Persist the translation once, so it does not re-run on every load. Only fires for the
+    // legacy value itself, so a later explicit user choice of wp_source/curve is never touched.
+    reshade::set_config_value(nullptr, kConfigSection, "DirectNeuralRenderingEncoding",
+                              s.encoding);
+    reshade::set_config_value(nullptr, kConfigSection, "DirectNeuralRenderingWhitePointSource",
+                              s.wp_source);
+    reshade::set_config_value(nullptr, kConfigSection, "DirectNeuralRenderingCurve", s.curve);
   }
   if (s.encoding < 0 || s.encoding > nr_runner::kEncScrgbNl) s.encoding = 0;
   if (s.wp_source < 0 || s.wp_source > nr_runner::kWpMeasured)
