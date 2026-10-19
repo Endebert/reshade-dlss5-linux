@@ -3,6 +3,8 @@
 [![build](https://github.com/RianGoossens/reshade-dlss5-linux/actions/workflows/build.yml/badge.svg)](https://github.com/RianGoossens/reshade-dlss5-linux/actions/workflows/build.yml)
 [![license: GPL-3.0](https://img.shields.io/badge/license-GPL--3.0-blue.svg)](LICENSE)
 
+Maintained by [Rian Goossens](https://github.com/RianGoossens).
+
 A ReShade add-on that makes **NVIDIA DLSS 5 Neural Rendering** (DLSSNR — NGX feature 18)
 run on **Linux / Proton**.
 
@@ -346,11 +348,19 @@ which identifies the model build you were running.
 > [Dagherbou's OptiScaler_DLSSNR](https://github.com/Dagherbou/OptiScaler_DLSSNR), itself a fork of
 > [OptiScaler](https://github.com/optiscaler/OptiScaler).
 >
-> Lineage: OptiScaler → OptiScaler_DLSSNR (Dagherbou) → addon-dlssnr-linux (NapXDD) → this fork.
+> Lineage: OptiScaler → OptiScaler_DLSSNR (Dagherbou) → addon-dlssnr-linux (NapXDD) → this fork
+> (Rian Goossens).
 >
 > The file names (`dlssnr-linux.addon64`, `nvngx.dll_nrfwd.dll`) and the `[ADDON_DLSSNR_LINUX]`
 > ini section are NapXDD's, kept so this drops in over an addon-dlssnr-linux install; old
 > settings are migrated.
+
+This fork:
+
+- **Rian Goossens** (<https://github.com/RianGoossens>): standalone mode for D3D12, D3D11 and
+  Vulkan games, the D3D11 and Vulkan transports, Model resolution, and maintenance.
+- **Endebert** (<https://github.com/Endebert>): *Model resolution → Render* in games with DLSS
+  ([#2](https://github.com/RianGoossens/reshade-dlss5-linux/pull/2)).
 
 This project was studied from, and stands on, the following work. Please support the originals.
 
