@@ -21,6 +21,7 @@
 #include <reshade.hpp>
 
 #include "ngx_probe.hpp"
+#include "ffx_api.hpp"
 #include "nr_d3d11.hpp"
 #include "nr_vulkan.hpp"
 
@@ -79,6 +80,7 @@ void OnPresent(reshade::api::command_queue*, reshade::api::swapchain*,
                const reshade::api::rect*, const reshade::api::rect*,
                uint32_t, const reshade::api::rect*) {
   ngx_probe::TryInstall();
+  ffx_probe::Install();  // idempotent, cheap when no FFX module is loaded yet
 
   // F10 toggles the NR pass, edge-triggered, for instant A/B comparison.
   static bool f10_was_down = false;
@@ -676,6 +678,7 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lp_reserved) {
       // where the detours must be removed before this image disappears.
       if (lp_reserved != nullptr) break;
       ngx_probe::Uninstall();
+      ffx_probe::Uninstall();
       nr_d3d11::Shutdown();
       nr_vulkan::Shutdown(nullptr);  // the device's own objects die with it
       nr_runner::Shutdown();

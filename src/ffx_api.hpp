@@ -232,4 +232,236 @@ extern "C" inline void OnUpscaleGeometry(const ffx_api::ffxDispatchDescUpscale& 
 
 }  // namespace ffx_probe
 
+// --- Detours installation (Task 2) ---------------------------------------------
+// The FFX API attach, shape-copied from ngx_probe::TryInstall/Uninstall: same
+// process-wide stale-detour marker, same blocked state, same all-or-nothing
+// transaction discipline. The hook bodies are stubs for now -- they forward to
+// real_* (dispatch adds the first-3-then-heartbeat line so the attach is
+// verifiable from the log); Task 3 wires the extraction in.
+// NR_HOST_MOCK guard: the host unit-test build has neither <windows.h> nor
+// <detours.h>. The declarations above stay visible in both modes; only this
+// section compiles in the real build.
+#ifndef NR_HOST_MOCK
+
+#include "ngx_probe.hpp"  // Logf/Warnf + AttachedMarker (one marker per process)
+
+namespace ffx_probe {
+
+// Dump the first few dispatches, then a one-liner heartbeat (the constants
+// pattern of ngx_probe.hpp:213).
+constexpr uint32_t kFullDumps = 3;
+constexpr uint32_t kHeartbeatEvery = 600;
+
+// The exported entry points as ffx_api.h declares them: the context handle is
+// an opaque pointer, the return code a uint32_t. The allocation-callbacks
+// struct is only ever passed through to the real implementation, so it stays
+// incomplete here.
+using ffxContext = void*;
+using ffxReturnCode_t = uint32_t;
+struct ffxAllocationCallbacks;
+
+static ffxReturnCode_t (*real_CreateContext)(ffxContext*,
+                                             ffx_api::ffxCreateContextDescHeader*,
+                                             const ffxAllocationCallbacks*) = nullptr;
+static ffxReturnCode_t (*real_DestroyContext)(ffxContext*,
+                                               const ffxAllocationCallbacks*) = nullptr;
+static ffxReturnCode_t (*real_Dispatch)(ffxContext*,
+                                        const ffx_api::ffxDispatchDescHeader*) = nullptr;
+
+// Stub hook bodies (Task 3/6 replace them): forward to the real export. The
+// dispatch one carries the first-3-then-heartbeat line, nothing else.
+inline ffxReturnCode_t HookFfxCreateContext(ffxContext* context,
+                                            ffx_api::ffxCreateContextDescHeader* desc,
+                                            const ffxAllocationCallbacks* memCb) {
+  return real_CreateContext(context, desc, memCb);
+}
+
+inline ffxReturnCode_t HookFfxDestroyContext(ffxContext* context,
+                                             const ffxAllocationCallbacks* memCb) {
+  return real_DestroyContext(context, memCb);
+}
+
+inline ffxReturnCode_t HookFfxDispatch(ffxContext* context,
+                                       const ffx_api::ffxDispatchDescHeader* desc) {
+  static uint32_t count = 0;
+  const uint32_t n = ++count;
+  if (n <= kFullDumps) {
+    ngx_probe::Logf("ffx-probe: ffxDispatch #%u context=%p", n, context);
+  } else if (n % kHeartbeatEvery == 0) {
+    ngx_probe::Logf("ffx-probe: ffxDispatch #%u (alive)", n);
+  }
+  return real_Dispatch(context, desc);
+}
+
+struct HookEntry {
+  const char* export_name;
+  void** real;
+  void* hook;
+};
+
+inline const HookEntry kHooks[] = {
+    {"ffxCreateContext", reinterpret_cast<void**>(&real_CreateContext),
+     reinterpret_cast<void*>(&HookFfxCreateContext)},
+    {"ffxDestroyContext", reinterpret_cast<void**>(&real_DestroyContext),
+     reinterpret_cast<void*>(&HookFfxDestroyContext)},
+    {"ffxDispatch", reinterpret_cast<void**>(&real_Dispatch),
+     reinterpret_cast<void*>(&HookFfxDispatch)},
+};
+
+// Defined here next to the declaration at the probe interface (same ODR note as
+// active_upscale_flags above).
+inline bool installed = false;
+inline bool blocked = false;  // a state Install must never retry out of
+// Whether ngx_probe's live detours owned the marker when we attached: the
+// marker is one process-wide fact, and when it is shared only NGX's own
+// uninstall decides when it may clear (ours can only re-mark it).
+inline bool marker_shared = false;
+// The module actually hooked (the panel / Task 5 status reads which upscaler
+// is in use); null until the attach succeeds.
+inline HMODULE upscaler_module = nullptr;
+
+// Try to attach to the first FFX loader/upscaler module present in the process.
+// Returns true once hooks are installed (further calls are no-ops). Cheap when
+// nothing is loaded yet -- safe to call every present until it succeeds.
+// All-or-nothing: every export the module provides is hooked, or none are.
+inline bool Install() {
+  if (installed) return true;
+  if (blocked) return false;
+
+  // Loader first (the surface games resolve through), upscaler DLL second. No
+  // scan of all loaded modules in v1: a game that ships a differently named
+  // module gets an explicit candidate added here instead.
+  const char* candidates[] = {"amd_fidelityfx_loader_dx12.dll",
+                              "amd_fidelityfx_upscaler_dx12.dll"};
+
+  HMODULE module = nullptr;
+  const char* module_name = nullptr;
+  for (const char* candidate : candidates) {
+    module = GetModuleHandleA(candidate);
+    if (module != nullptr && GetProcAddress(module, "ffxDispatch") != nullptr) {
+      module_name = candidate;
+      break;
+    }
+    module = nullptr;
+  }
+  if (module == nullptr) return false;
+
+  LONG* marker = ngx_probe::AttachedMarker();
+  if (marker != nullptr && *marker != 0 && !ngx_probe::installed) {
+    // A previous image of this DLL was unloaded without detaching: its detours
+    // point into freed memory, and patching over them builds a jmp cycle (the
+    // GTA V Enhanced hang, issue #3). Nothing can repair the exports from here.
+    // One marker per process (ngx_probe's guard comment): a stale NGX detour
+    // and a stale FFX detour must equally block. ngx_probe::installed is the
+    // live-vs-stale discriminator -- a marker this image's NGX attach just set
+    // is a live detour chain to chain onto, not a stale one to refuse.
+    ngx_probe::Warnf("ffx-probe: not hooking (marker)");
+    blocked = true;
+    return false;
+  }
+
+  if (DetourTransactionBegin() != NO_ERROR) {
+    ngx_probe::Log("ffx-probe: DetourTransactionBegin failed");
+    return false;
+  }
+  DetourUpdateThread(GetCurrentThread());
+
+  int attached = 0;
+  bool failed = false;
+  for (const auto& entry : kHooks) {
+    FARPROC proc = GetProcAddress(module, entry.export_name);
+    if (proc == nullptr) {
+      // Not an error: a stripped module may carry only part of the API.
+      ngx_probe::Logf("ffx-probe: %s not exported by %s", entry.export_name, module_name);
+      continue;
+    }
+    *entry.real = reinterpret_cast<void*>(proc);
+    if (DetourAttach(entry.real, entry.hook) != NO_ERROR) {
+      ngx_probe::Warnf("ffx-probe: DetourAttach failed for %s", entry.export_name);
+      failed = true;
+      break;
+    }
+    ++attached;
+  }
+
+  if (failed || attached == 0) {
+    DetourTransactionAbort();
+    for (const auto& entry : kHooks) *entry.real = nullptr;
+    // A failed attach is deterministic for a given export -- retrying every
+    // present would only repeat it (and flood the log). Stay unhooked.
+    if (failed) blocked = true;
+    return false;
+  }
+  if (DetourTransactionCommit() != NO_ERROR) {
+    // A failed commit aborts the transaction itself: no patches were applied.
+    ngx_probe::Log("ffx-probe: DetourTransactionCommit failed");
+    for (const auto& entry : kHooks) *entry.real = nullptr;
+    blocked = true;
+    return false;
+  }
+
+  marker_shared = marker != nullptr && *marker != 0;
+  if (marker != nullptr) *marker = 1;
+  installed = true;
+  upscaler_module = module;
+  ngx_probe::Logf("ffx-probe: hooked %d FFX exports on %s", attached, module_name);
+  return true;
+}
+
+// Mirror of Install, for DllMain(DLL_PROCESS_DETACH) on FreeLibrary: the
+// detours must not outlive the DLL image they jump into. Anything left
+// attached here keeps the marker set, so no later load hooks on top of it.
+inline void Uninstall() {
+  if (!installed) return;
+
+  if (DetourTransactionBegin() != NO_ERROR) {
+    ngx_probe::Warnf("ffx-probe: DetourTransactionBegin failed on uninstall — detours leak");
+    return;
+  }
+  DetourUpdateThread(GetCurrentThread());
+
+  bool queued[std::size(kHooks)] = {};
+  bool all = true;
+  int detached = 0;
+  for (size_t i = 0; i < std::size(kHooks); ++i) {
+    if (*kHooks[i].real == nullptr) continue;
+    if (DetourDetach(kHooks[i].real, kHooks[i].hook) != NO_ERROR) {
+      ngx_probe::Warnf("ffx-probe: DetourDetach failed for %s — that detour leaks",
+                       kHooks[i].export_name);
+      all = false;
+      continue;
+    }
+    queued[i] = true;
+    ++detached;
+  }
+
+  if (DetourTransactionCommit() != NO_ERROR) {
+    // A failed commit aborts the transaction itself: everything stays patched.
+    ngx_probe::Warnf("ffx-probe: DetourTransactionCommit failed on uninstall — detours leak");
+    return;
+  }
+
+  for (size_t i = 0; i < std::size(kHooks); ++i) {
+    if (queued[i]) *kHooks[i].real = nullptr;
+  }
+  installed = false;
+  if (all) upscaler_module = nullptr;
+  if (LONG* marker = ngx_probe::AttachedMarker(); marker != nullptr) {
+    if (marker_shared) {
+      // Shared with NGX's live detours; DllMain detaches NGX first, so its
+      // outcome already decided the marker. Only re-mark it if ours leak.
+      if (!all) *marker = 1;
+    } else {
+      // Ours set it from zero: cleared only if all detached (a leak keeps the
+      // stale state marked for the next image).
+      *marker = all ? 0 : 1;
+    }
+  }
+  ngx_probe::Logf("ffx-probe: detached %d FFX hooks", detached);
+}
+
+}  // namespace ffx_probe
+
+#endif  // NR_HOST_MOCK (Detours installation section)
+
 #endif  // !NR_HOST_MODE_CONTRACT_ERROR
