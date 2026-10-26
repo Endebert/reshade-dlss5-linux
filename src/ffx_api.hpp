@@ -243,7 +243,7 @@ extern "C" inline void OnUpscaleGeometry(const ffx_api::ffxDispatchDescUpscale& 
 // section compiles in the real build.
 #ifndef NR_HOST_MOCK
 
-#include "ngx_probe.hpp"  // Logf/Warnf + AttachedMarker (one marker per process)
+#include "ngx_probe.hpp"  // Logf/Warnf + AttachedMarker (one marker per probe)
 
 namespace ffx_probe {
 
@@ -312,10 +312,6 @@ inline const HookEntry kHooks[] = {
 // active_upscale_flags above).
 inline bool installed = false;
 inline bool blocked = false;  // a state Install must never retry out of
-// Whether ngx_probe's live detours owned the marker when we attached: the
-// marker is one process-wide fact, and when it is shared only NGX's own
-// uninstall decides when it may clear (ours can only re-mark it).
-inline bool marker_shared = false;
 // The module actually hooked (the panel / Task 5 status reads which upscaler
 // is in use); null until the attach succeeds.
 inline HMODULE upscaler_module = nullptr;
@@ -346,15 +342,13 @@ inline bool Install() {
   }
   if (module == nullptr) return false;
 
-  LONG* marker = ngx_probe::AttachedMarker();
-  if (marker != nullptr && *marker != 0 && !ngx_probe::installed) {
+  LONG* marker = ngx_probe::AttachedMarker("ffx");
+  if (marker != nullptr && *marker != 0) {
     // A previous image of this DLL was unloaded without detaching: its detours
     // point into freed memory, and patching over them builds a jmp cycle (the
     // GTA V Enhanced hang, issue #3). Nothing can repair the exports from here.
-    // One marker per process (ngx_probe's guard comment): a stale NGX detour
-    // and a stale FFX detour must equally block. ngx_probe::installed is the
-    // live-vs-stale discriminator -- a marker this image's NGX attach just set
-    // is a live detour chain to chain onto, not a stale one to refuse.
+    // The marker is keyed by probe (ngx_probe's guard comment): only a stale
+    // FFX detour of ours can be set here, and it blocks only this probe.
     ngx_probe::Warnf("ffx-probe: not hooking (marker)");
     blocked = true;
     return false;
@@ -400,7 +394,6 @@ inline bool Install() {
     return false;
   }
 
-  marker_shared = marker != nullptr && *marker != 0;
   if (marker != nullptr) *marker = 1;
   installed = true;
   upscaler_module = module;
@@ -446,16 +439,10 @@ inline void Uninstall() {
   }
   installed = false;
   if (all) upscaler_module = nullptr;
-  if (LONG* marker = ngx_probe::AttachedMarker(); marker != nullptr) {
-    if (marker_shared) {
-      // Shared with NGX's live detours; DllMain detaches NGX first, so its
-      // outcome already decided the marker. Only re-mark it if ours leak.
-      if (!all) *marker = 1;
-    } else {
-      // Ours set it from zero: cleared only if all detached (a leak keeps the
-      // stale state marked for the next image).
-      *marker = all ? 0 : 1;
-    }
+  if (LONG* marker = ngx_probe::AttachedMarker("ffx"); marker != nullptr) {
+    // Our own marker: cleared only if all detached (a leak keeps the stale
+    // state marked so the next image of this probe refuses to re-attach).
+    *marker = all ? 0 : 1;
   }
   ngx_probe::Logf("ffx-probe: detached %d FFX hooks", detached);
 }

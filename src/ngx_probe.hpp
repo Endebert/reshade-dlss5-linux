@@ -19,6 +19,8 @@
 #include <cstdint>
 #include <cstdio>
 #include <iterator>
+#include <map>
+#include <string>
 
 #include <d3d11.h>
 #include <d3d12.h>
@@ -349,16 +351,23 @@ inline bool blocked = false;  // a state TryInstall must never retry out of
 // detour and a live one from another tool (hook chaining is legal) are byte
 // identical. So the fact lives in a named mapping that is deliberately never
 // closed: it survives our unload, and the next image finds it by name.
-// Nonzero while our detours are attached; zeroed by a clean detach.
-inline LONG* AttachedMarker() {
-  static LONG* marker = [] {
+// Nonzero while our detours are attached; zeroed by a clean detach. The name
+// is keyed by probe: each marker guards *that probe's* detour set, so a stale
+// detour of one probe blocks only that probe's re-attach. Cross-probe blocking
+// has no jmp-cycle basis — different probes patch different function bodies.
+inline LONG* AttachedMarker(const char* tag) {
+  static std::map<std::string, LONG*> markers;
+  const auto it = markers.find(tag);
+  if (it != markers.end()) return it->second;
+  LONG* marker = [tag]() -> LONG* {
     char name[64];
-    std::snprintf(name, sizeof(name), "Local\\dlssnr-ngx-hooks-%lu", GetCurrentProcessId());
+    std::snprintf(name, sizeof(name), "Local\\dlssnr-%s-hooks-%lu", tag, GetCurrentProcessId());
     const HANDLE mapping = CreateFileMappingA(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0,
                                               sizeof(LONG), name);  // opens the existing one
     if (mapping == nullptr) return static_cast<LONG*>(nullptr);
     return static_cast<LONG*>(MapViewOfFile(mapping, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(LONG)));
   }();
+  markers.emplace(tag, marker);
   return marker;
 }
 
@@ -386,7 +395,7 @@ inline bool TryInstall() {
   }
   if (module == nullptr) return false;
 
-  LONG* marker = AttachedMarker();
+  LONG* marker = AttachedMarker("ngx");
   if (marker != nullptr && *marker != 0) {
     // A previous image of this DLL was unloaded without detaching. Its detours
     // point into freed memory; patching over them builds a jmp cycle (the GTA V
@@ -479,7 +488,7 @@ inline void Uninstall() {
   }
   installed = false;
   if (all) {
-    if (LONG* marker = AttachedMarker(); marker != nullptr) *marker = 0;
+    if (LONG* marker = AttachedMarker("ngx"); marker != nullptr) *marker = 0;
   }
   Logf("ngx-probe: detached %d NGX hooks", detached);
 }
