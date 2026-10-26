@@ -6,7 +6,20 @@
 
 #include <stdint.h>
 
-#include "nr_runner.hpp"  // nr_runner::Inputs / nr_runner::s — self-includes under NR_HOST_MOCK
+// Build-mode contract, enforced rather than assumed (task 1 review finding 2):
+// nr_runner.hpp picks between the real Windows/NGX include block and the host
+// source mock from NR_HOST_MOCK, and that selection is pinned by the first of
+// nr_runner.hpp / this header to be included in a TU.
+//   - Real MSVC-targeted build: define nothing (exactly as before; the guard
+//     nr_runner.hpp installs only fires for non-Windows compilers).
+//   - Host g++ test build: `#define NR_HOST_MOCK` before the first of these two
+//     headers. A host compile that gets that wrong fails with an #error naming
+//     the contract (nr_runner.hpp) instead of an opaque missing <windows.h>.
+#include "nr_runner.hpp"  // nr_runner::Inputs / nr_runner::s — mode per the contract above
+
+// If the contract above was violated, nr_runner.hpp has already reported it with
+// its #error; skip this header's body so that error is the only diagnostic.
+#ifndef NR_HOST_MODE_CONTRACT_ERROR
 
 // The SDK declares everything inside extern "C"; these are plain aggregates either
 // way, so the vendored slice is transcribed as C++ declarations inside a namespace.
@@ -138,6 +151,8 @@ struct ffxDispatchDescUpscale {
 // The create-context upscale flags captured by the ffxCreateContext hook (Task 3
 // writes; read here by UpscaleInputs/OnUpscaleGeometry). Zero until an upscale
 // create desc has been seen, so before any upscale create every FFX flag reads off.
+// Declared only; the single inline definition is further down (one entity across
+// all TUs that include this header -- no ODR violation at link).
 extern uint32_t active_upscale_flags;
 
 }  // namespace ffx_api
@@ -147,7 +162,8 @@ extern uint32_t active_upscale_flags;
 namespace ffx_probe {
 
 // extern "C" (as in the plan) so the test links the definitions at file scope in
-// this header by their unmangled names.
+// this header by their unmangled names; the definitions below are inline as well --
+// the same ODR constraint as active_upscale_flags: several TUs include this header.
 extern "C" bool UpscaleInputs(const ffx_api::ffxDispatchDescUpscale* d, nr_runner::Inputs* in);
 extern "C" void OnUpscaleGeometry(const ffx_api::ffxDispatchDescUpscale& d,
                                    const nr_runner::Inputs& in);
@@ -161,16 +177,23 @@ extern bool installed;
 // zero until then, so every FFX flag reads off before any upscale create (Task 3's
 // ffxCreateContext hook writes it, next to the saw_upscale_create bookkeeping).
 namespace ffx_api {
-uint32_t active_upscale_flags = 0;
+// inline: this header is included by more than one TU (the test and Task 3's hook
+// code); a non-inline definition here would be a multiple-definition link error.
+inline uint32_t active_upscale_flags = 0;
 }
 
 // --- extraction (Task 1 bodies) -----------------------------------------------
+// Definitions live in ffx_probe next to their declarations: a non-inline
+// declaration in one scope and an inline definition in another is exactly the
+// declaration/definition mismatch that keeps the weak (emittable) copy from being
+// emitted; same scope, inline definition wins and every TU gets the symbol.
+namespace ffx_probe {
 
 // Pure: pulls the guides an upscale dispatch carries into the frame's Inputs. False
 // unless the dispatch desc is an upscale one, so a non-upscale dispatch (frame
 // generation, CAS, any other effect in the chain) can never feed the pass even if a
 // caller forgets to filter first.
-extern "C" bool UpscaleInputs(const ffx_api::ffxDispatchDescUpscale* d, nr_runner::Inputs* in) {
+extern "C" inline bool UpscaleInputs(const ffx_api::ffxDispatchDescUpscale* d, nr_runner::Inputs* in) {
   if (d == nullptr || in == nullptr) return false;
   if (d->header.type != FFX_API_DISPATCH_DESC_TYPE_UPSCALE) return false;
   in->depth = static_cast<ID3D12Resource*>(d->depth.resource);
@@ -190,8 +213,8 @@ extern "C" bool UpscaleInputs(const ffx_api::ffxDispatchDescUpscale* d, nr_runne
 // the render/upscale sizes into the dlss_* slots the source branch applies. The
 // DepthInverted bit (same value 1<<3 in both flag words) carries over so ReadGuides'
 // consumers see it; the other FFX create flags are not DLSS flags and stay unmapped.
-extern "C" void OnUpscaleGeometry(const ffx_api::ffxDispatchDescUpscale& d,
-                                  const nr_runner::Inputs& in) {
+extern "C" inline void OnUpscaleGeometry(const ffx_api::ffxDispatchDescUpscale& d,
+                                        const nr_runner::Inputs& in) {
   nr_runner::s.dlss_render_w = d.renderSize.width;
   nr_runner::s.dlss_render_h = d.renderSize.height;
   nr_runner::s.dlss_out_w = d.upscaleSize.width;
@@ -206,3 +229,7 @@ extern "C" void OnUpscaleGeometry(const ffx_api::ffxDispatchDescUpscale& d,
   nr_runner::s.color_in_h = d.color.description.height;
   (void)in;  // the extraction itself lands in Inputs; geometry is state only
 }
+
+}  // namespace ffx_probe
+
+#endif  // !NR_HOST_MODE_CONTRACT_ERROR

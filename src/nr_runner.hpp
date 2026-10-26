@@ -29,8 +29,21 @@
 // nr_runner's own translation unit to compile. The test never calls any of it, and a
 // function that is declared but never called contributes no code to the object, so
 // the absent bodies never reach the link. The real build never defines NR_HOST_MOCK
-// and sees this branch as one closed block -- zero impact.
+// and sees this branch as one closed block -- zero impact. The contract is enforced,
+// not assumed: a host TU that reaches the real branch without the macro fails with
+// the #error below instead of an opaque missing <windows.h>.
 #ifndef NR_HOST_MOCK
+
+// Enforced mode contract (task 1 review finding 2): on a host (non-Windows)
+// compiler this branch is only reachable when NR_HOST_MOCK was not defined before
+// this header -- wrong include order or a forgotten #define. Fail with that single
+// clear error and skip the rest of the file so nothing cascades behind it. The
+// MSVC-targeted build defines _MSC_VER/_WIN32, takes the else branch, and is
+// unaffected (same includes, same order).
+#if !defined(_WIN32) && !defined(_MSC_VER)
+#error "nr_runner.hpp: host build without NR_HOST_MOCK -- define NR_HOST_MOCK before including nr_runner.hpp or ffx_api.hpp (the mode contract documented at the top of this file)."
+#define NR_HOST_MODE_CONTRACT_ERROR 1
+#else
 
 #include <windows.h>
 
@@ -52,7 +65,8 @@
 #pragma comment(lib, "bcrypt")   // SHA-256 of the model DLL
 #pragma comment(lib, "version")  // its file-version resource
 
-#else  // NR_HOST_MOCK
+#endif  // real Windows/NGX include block
+#else   // NR_HOST_MOCK
 
 #include <atomic>
 #include <cstdint>
@@ -64,6 +78,10 @@
 #include "../test/unit/ffx_mock.hpp"  // Win32/NGX/D3D12/compose stand-ins + ngx_probe loggers
 
 #endif  // NR_HOST_MOCK
+
+// On a host-mode contract violation (see #error above) everything below is
+// skipped so the contract error is the only diagnostic the compile produces.
+#ifndef NR_HOST_MODE_CONTRACT_ERROR
 
 namespace nr_runner {
 
@@ -1637,3 +1655,4 @@ inline bool SubmitStandaloneShared(ID3D12Fence* shared, UINT64 wait_value, UINT6
 
 }  // namespace nr_runner
 
+#endif  // NR_HOST_MODE_CONTRACT_ERROR
