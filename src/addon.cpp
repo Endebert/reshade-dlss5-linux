@@ -510,7 +510,8 @@ void OnDrawOverlay(reshade::api::effect_runtime*) {
                     "the frame; standalone arms 10 s after start when neither showed up).\n"
                     "Force DLSS runs only in the game's DLSS session, Force FSR3 only on FSR3 "
                     "dispatches (the game's DLSS and standalone are ignored), Force standalone "
-                    "is the frame-by-frame source regardless.");
+                    "runs every frame except while the game's own DLSS is actively evaluating "
+                    "(it defers to a fresh DLSS session, not to FSR3).");
     if (s.sa_status[0] != 0 && source != nr_runner::kSrcDlss)
       ImGui::TextDisabled("Standalone: %s", s.sa_status);
   }

@@ -212,6 +212,14 @@ void TestArbiterPriorityAndForces() {
   assert(SourceChoice(kNow, kStale, kFresh, nr_runner::kFsDlss) == -1);
   // ...and Force standalone claims regardless of activity or arm (the old Always).
   assert(SourceChoice(kNow, 0, 0, nr_runner::kFsStandalone) == nr_runner::kSrcStandalone);
+  // Force standalone with a *fresh FSR stamp* and stale (or zero) DLSS still picks
+  // standalone. The arbiter already returns kSrcStandalone unconditionally here -- this
+  // pins it against future drift: StandaloneAllowed's force branch defers only to a
+  // fresh DLSS session, never to last_fsr, so an FSR-active game still gets a frame
+  // source instead of standing by forever.
+  assert(SourceChoice(kNow, kStale, kFresh, nr_runner::kFsStandalone) ==
+         nr_runner::kSrcStandalone);
+  assert(SourceChoice(kNow, 0, kFresh, nr_runner::kFsStandalone) == nr_runner::kSrcStandalone);
 }
 
 // Zero stamps mean "never seen" and never count as fresh, whatever the clock says.

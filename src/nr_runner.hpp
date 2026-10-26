@@ -1392,14 +1392,15 @@ inline bool StandaloneAllowed() {
   }
   const ULONGLONG last_dlss = s.last_dlss_tick.load(std::memory_order_relaxed);
   const ULONGLONG last_fsr = s.last_fsr_tick.load(std::memory_order_relaxed);
-  // The old Always: no bridge/nvngx/arm checks, but a fresh session still owns the frame
-  // (the quiet check old kSaAlways already had, its FSR3 twin added). Walked through
-  // SourceChoice's Auto ordering purely for that freshness; Force never reads the arm.
+  // The old Always: no bridge/nvngx/arm checks, and it defers only to a fresh DLSS
+  // session -- never to FSR. Under Force standalone the FSR pass is excluded (the
+  // SourceChoice force branch claims kSrcStandalone unconditionally), so an FSR stamp
+  // deferring here would leave an FSR-active game with no frame source at all. The DLSS
+  // path is not gated under Force standalone, so a fresh evaluate can still own the frame.
   if (fs == kFsStandalone) {
-    const int c = SourceChoice(now, last_dlss, last_fsr, kFsAuto);
-    if (c == kSrcDlss || c == kSrcFsr) {
-      std::snprintf(s.sa_status, sizeof(s.sa_status), "standing by: a %s session is the source",
-                    c == kSrcDlss ? "DLSS" : "FSR3");
+    if (last_dlss != 0 && now - last_dlss < kDlssQuietMs) {
+      std::snprintf(s.sa_status, sizeof(s.sa_status),
+                    "standing by: a DLSS session is the source");
       return false;
     }
     return true;
