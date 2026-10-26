@@ -245,11 +245,21 @@ extern "C" inline void OnUpscaleGeometry(const ffx_api::ffxDispatchDescUpscale& 
 
 #include "ngx_probe.hpp"  // Logf/Warnf + AttachedMarker (one marker per probe)
 
+// Task 3: the hook bodies delegate to nr_fsr. Declared here rather than included:
+// nr_fsr.hpp includes this header for the vendored types, so including it back
+// would close the cycle. The only TU that compiles this section (addon.cpp)
+// includes nr_fsr.hpp alongside this header, so both inline definitions are in
+// that TU before it ends.
+namespace nr_fsr {
+inline void OnFfxCreateContext(const ffx_api::ffxCreateContextDescHeader* header);
+inline void OnFfxDispatch(void* command_list, const ffx_api::ffxDispatchDescHeader* header);
+}  // namespace nr_fsr
+
 namespace ffx_probe {
 
-// Dump the first few dispatches, then a one-liner heartbeat (the constants
-// pattern of ngx_probe.hpp:213).
-constexpr uint32_t kFullDumps = 3;
+// Heartbeat cadence for the dispatch hook (the constants pattern of
+// ngx_probe.hpp:213); the first-3 full dumps moved to nr_fsr, which logs the
+// dispatch's resources and sizes.
 constexpr uint32_t kHeartbeatEvery = 600;
 
 // The exported entry points as ffx_api.h declares them: the context handle is
@@ -268,12 +278,16 @@ static ffxReturnCode_t (*real_DestroyContext)(ffxContext*,
 static ffxReturnCode_t (*real_Dispatch)(ffxContext*,
                                         const ffx_api::ffxDispatchDescHeader*) = nullptr;
 
-// Stub hook bodies (Task 3/6 replace them): forward to the real export. The
-// dispatch one carries the first-3-then-heartbeat line, nothing else.
+// Hook bodies (Task 6 completes the dispatch ordering): both forward through the
+// trampoline. CreateContext records after the real create has seen the desc;
+// Dispatch classifies/extracts before it (Task 3), heartbeat, then forwards --
+// Task 6 swaps where the trampoline goes relative to its recording, per mode.
 inline ffxReturnCode_t HookFfxCreateContext(ffxContext* context,
                                             ffx_api::ffxCreateContextDescHeader* desc,
                                             const ffxAllocationCallbacks* memCb) {
-  return real_CreateContext(context, desc, memCb);
+  const ffxReturnCode_t r = real_CreateContext(context, desc, memCb);
+  nr_fsr::OnFfxCreateContext(desc);
+  return r;
 }
 
 inline ffxReturnCode_t HookFfxDestroyContext(ffxContext* context,
@@ -283,11 +297,13 @@ inline ffxReturnCode_t HookFfxDestroyContext(ffxContext* context,
 
 inline ffxReturnCode_t HookFfxDispatch(ffxContext* context,
                                        const ffx_api::ffxDispatchDescHeader* desc) {
+  // Tick/classify/extract first (nr_fsr logs the first 3 dispatches), heartbeat,
+  // then the trampoline. Task 6 swaps the trampoline's place relative to its
+  // recording inside OnFfxDispatch's contract.
+  nr_fsr::OnFfxDispatch(context, desc);
   static uint32_t count = 0;
   const uint32_t n = ++count;
-  if (n <= kFullDumps) {
-    ngx_probe::Logf("ffx-probe: ffxDispatch #%u context=%p", n, context);
-  } else if (n % kHeartbeatEvery == 0) {
+  if (n % kHeartbeatEvery == 0) {
     ngx_probe::Logf("ffx-probe: ffxDispatch #%u (alive)", n);
   }
   return real_Dispatch(context, desc);

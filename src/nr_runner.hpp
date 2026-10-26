@@ -278,7 +278,8 @@ struct State {
   // cannot flip mid-frame; the overlay writes `model_resolution` instead. `source` is a second PreSr()
   // input and is written from the present thread in OnStandaloneFrame; the DLSS-quiet gate (no
   // evaluates for 3 s) keeps a standalone frame from running alongside an evaluate, which is a
-  // timing argument rather than an enforced invariant.
+  // timing argument rather than an enforced invariant -- and FSR dispatches may arrive from another
+  // thread than the evaluates, so `source` and the tick stamps are relaxed atomics.
   int dlss_resolution = 0;
   // Render: the DLSS-SR color input's own size. A game with dynamic resolution allocates it at
   // the largest render size and renders a subrect of it (High on Life: 1116x628 holding
@@ -287,8 +288,12 @@ struct State {
 
   // Where the frame comes from. Standalone runs off the back buffer, ReShade's depth and a
   // motion-vector effect, for a D3D12 game with no DLSS session to hook.
-  int source = 0;                  // Source
-  ULONGLONG last_dlss_tick = 0;    // last DLSS-SR evaluate seen (GetTickCount64)
+  // Relaxed atomics: written from their own threads (present for source, the evaluate
+  // thread for last_dlss_tick, the game's dispatch thread for last_fsr_tick) and read
+  // across them -- a stamp for arbitration, never a handshake.
+  std::atomic<int> source{0};                 // Source
+  std::atomic<ULONGLONG> last_dlss_tick{0};   // last DLSS-SR evaluate seen (GetTickCount64)
+  std::atomic<ULONGLONG> last_fsr_tick{0};    // last FSR3 upscale dispatch seen (GetTickCount64)
   int standalone_mode = 0;         // 0 Auto, 1 Always, 2 Off
   bool sa_flip_x = false, sa_flip_y = false;  // motion-vector direction, standalone only
   bool temporal = true;            // false resets the model's history every frame (diagnostic)
@@ -345,7 +350,10 @@ enum ModelResolution : int { kResFull = 0, kResRender = 1 };
 // Whether this frame's pass runs before the game's DLSS-SR upscale (model resolution Render) and on
 // which geometry. Standalone has no DLSS stage to insert in front of, so it always post-processes
 // the frame it was handed.
-inline bool PreSr() { return s.dlss_resolution == kResRender && s.source != kSrcStandalone; }
+inline bool PreSr() {
+  return s.dlss_resolution == kResRender &&
+         s.source.load(std::memory_order_relaxed) != kSrcStandalone;
+}
 inline unsigned PassW() {
   return PreSr() ? (s.color_in_w != 0 ? s.color_in_w : s.render_w) : s.out_w;
 }
@@ -486,7 +494,8 @@ inline void TickGraveyard() {
 // release it at once. The graveyard's grace period exists for the game's own command lists; at
 // Pass Count 4 it otherwise holds several sets of four model instances in VRAM at a time.
 inline bool StandaloneIdle(DWORD timeout_ms) {
-  if (s.source != kSrcStandalone || s.sa_fence_out == nullptr || s.sa_event == nullptr)
+  if (s.source.load(std::memory_order_relaxed) != kSrcStandalone || s.sa_fence_out == nullptr ||
+      s.sa_event == nullptr)
     return false;
   if (s.sa_fence_out->GetCompletedValue() >= s.sa_value) return true;
   s.sa_fence_out->SetEventOnCompletion(s.sa_value, s.sa_event);
@@ -530,7 +539,8 @@ inline void OnDlssCreate(unsigned w, unsigned h, unsigned ow, unsigned oh, int f
   s.dlss_out_w = ow;
   s.dlss_out_h = oh;
   s.dlss_create_flags = flags;
-  if (s.source == kSrcStandalone) return;  // applied when the DLSS source takes over
+  if (s.source.load(std::memory_order_relaxed) == kSrcStandalone)
+    return;  // applied when the DLSS source takes over
   s.render_w = w;
   s.render_h = h;
   s.out_w = ow;
@@ -737,7 +747,7 @@ inline bool CreateTextures(ID3D12GraphicsCommandList* cmd, ID3D12Resource* game_
     s.output = s.color_copy = s.proxy = nullptr;
     return GiveUp("texture creation failed");
   }
-  const char* mode = s.source == kSrcStandalone   ? "standalone"
+  const char* mode = s.source.load(std::memory_order_relaxed) == kSrcStandalone ? "standalone"
                      : PreSr()                    ? "model resolution render"
                                                   : "model resolution full";
   ngx_probe::Logf("nr-fwd: textures %ux%u format=%u (answer, original, proxy, %s)", PassW(),
@@ -901,7 +911,7 @@ inline bool EnsureFeature(ID3D12GraphicsCommandList* cmd) {
   s.built_passes = s.pass_count < 1 ? 1 : (s.pass_count > kMaxPasses ? kMaxPasses : s.pass_count);
   s.feature_w = PassW();
   s.feature_h = PassH();
-  const char* where = s.source == kSrcStandalone   ? "standalone frame"
+  const char* where = s.source.load(std::memory_order_relaxed) == kSrcStandalone ? "standalone frame"
                       : PreSr()                    ? "render, before the SR upscale"
                                                    : "upscaled, after the SR upscale";
   ngx_probe::Logf("nr-fwd: pass geometry %ux%u (%s)", s.feature_w, s.feature_h, where);
@@ -1117,7 +1127,8 @@ inline void Evaluate(ID3D12GraphicsCommandList* cmd, const Inputs& in) {
 inline bool PreparePass(ID3D12GraphicsCommandList* cmd, const NVSDK_NGX_Parameter* game_params) {
   if (s.gave_up || cmd == nullptr || game_params == nullptr) return false;
   if (s.dlss_out_w == 0 || s.dlss_out_h == 0) return false;  // no DLSS-SR create seen yet
-  s.last_dlss_tick = GetTickCount64();  // even while disabled: standalone must stay out
+  // Even while disabled: standalone must stay out of an active DLSS session.
+  s.last_dlss_tick.store(GetTickCount64(), std::memory_order_relaxed);
 
   TickGraveyard();
   if (s.retire_pending.exchange(false, std::memory_order_relaxed))
@@ -1133,9 +1144,10 @@ inline bool PreparePass(ID3D12GraphicsCommandList* cmd, const NVSDK_NGX_Paramete
   }
   if (!s.enabled) return false;
 
-  if (s.source != kSrcDlss) {
-    if (s.source == kSrcStandalone) RetireFeature("the game's DLSS took over from standalone");
-    s.source = kSrcDlss;
+  const int cur_source = s.source.load(std::memory_order_relaxed);
+  if (cur_source != kSrcDlss) {
+    if (cur_source == kSrcStandalone) RetireFeature("the game's DLSS took over from standalone");
+    s.source.store(kSrcDlss, std::memory_order_relaxed);
     s.render_w = s.dlss_render_w;
     s.render_h = s.dlss_render_h;
     s.out_w = s.dlss_out_w;
@@ -1339,7 +1351,8 @@ inline bool StandaloneAllowed() {
     std::snprintf(s.sa_status, sizeof(s.sa_status), "off");
     return false;
   }
-  if (s.last_dlss_tick != 0 && now - s.last_dlss_tick < kDlssQuietMs) {
+  const ULONGLONG last_dlss = s.last_dlss_tick.load(std::memory_order_relaxed);
+  if (last_dlss != 0 && now - last_dlss < kDlssQuietMs) {
     std::snprintf(s.sa_status, sizeof(s.sa_status), "standing by: a DLSS session is the source");
     return false;
   }
@@ -1351,7 +1364,7 @@ inline bool StandaloneAllowed() {
     }
     // nvngx_dlss.dll resident before standalone started NGX means the game loaded it; after
     // that, standalone's own NGX init may have loaded it, so it says nothing.
-    if (s.last_dlss_tick != 0 ||
+    if (last_dlss != 0 ||
         (s.ngx_core == nullptr && GetModuleHandleA("nvngx_dlss.dll") != nullptr)) {
       std::snprintf(s.sa_status, sizeof(s.sa_status),
                     "standing by: this game has DLSS (set Standalone to Always to force it)");
@@ -1473,9 +1486,10 @@ inline bool OnStandaloneFrame(ID3D12Resource* back_buffer, ID3D12Resource* depth
     return false;
   }
 
-  if (s.source != kSrcStandalone) {
-    if (s.source == kSrcDlss) RetireFeature("switching to standalone");
-    s.source = kSrcStandalone;
+  const int cur_source = s.source.load(std::memory_order_relaxed);
+  if (cur_source != kSrcStandalone) {
+    if (cur_source == kSrcDlss) RetireFeature("switching to standalone");
+    s.source.store(kSrcStandalone, std::memory_order_relaxed);
     ngx_probe::Log("nr-fwd: source = standalone (back buffer + ReShade depth + motion vectors)");
   }
 

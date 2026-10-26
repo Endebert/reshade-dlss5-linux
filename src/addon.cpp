@@ -21,6 +21,7 @@
 #include <reshade.hpp>
 
 #include "ngx_probe.hpp"
+#include "nr_fsr.hpp"  // FSR3 dispatch/create handlers (needs nr_runner, via ngx_probe)
 #include "ffx_api.hpp"
 #include "nr_d3d11.hpp"
 #include "nr_vulkan.hpp"
@@ -477,15 +478,16 @@ void OnDrawOverlay(reshade::api::effect_runtime*) {
   Edit bridge;  // colour bridge and compose: live
 
   {
-    const char* source = s.source == nr_runner::kSrcDlss         ? "the game's DLSS session"
-                         : s.source == nr_runner::kSrcStandalone ? "standalone"
-                                                                 : "waiting for a frame";
-    ImGui::Text("Source: %s", source);
+    const int source = s.source.load(std::memory_order_relaxed);
+    const char* source_name = source == nr_runner::kSrcDlss         ? "the game's DLSS session"
+                              : source == nr_runner::kSrcStandalone ? "standalone"
+                                                                    : "waiting for a frame";
+    ImGui::Text("Source: %s", source_name);
     bridge |= Combo("Standalone##mode", &s.standalone_mode, "Auto\0Always\0Off\0", 0,
                     "For D3D12 games without DLSS: run off the back buffer, ReShade's depth "
                     "(Generic Depth) and iMMERSE Launchpad's motion vectors, with no bridge.\n"
                     "Auto runs it only when the game has no DLSS of its own.");
-    if (s.sa_status[0] != 0 && s.source != nr_runner::kSrcDlss)
+    if (s.sa_status[0] != 0 && source != nr_runner::kSrcDlss)
       ImGui::TextDisabled("Standalone: %s", s.sa_status);
   }
 
@@ -634,7 +636,7 @@ void OnDrawOverlay(reshade::api::effect_runtime*) {
     Tip("Off resets the model's history every frame: no ghosting or drag from motion vectors, "
         "but less stable detail. A diagnostic: if drag disappears with this off, the motion "
         "vectors are the cause.");
-    ImGui::BeginDisabled(s.source != nr_runner::kSrcStandalone);
+    ImGui::BeginDisabled(s.source.load(std::memory_order_relaxed) != nr_runner::kSrcStandalone);
     ImGui::Checkbox("Flip motion X", &s.sa_flip_x);
     Tip("Standalone only. Reverses the motion vectors' horizontal direction; the right setting is "
         "the one where moving things drag least.");
