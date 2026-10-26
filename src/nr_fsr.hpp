@@ -5,8 +5,9 @@
 // only the detour plumbing.
 //
 // Task 3 scope: tick, classify, extract. The create hook captures the upscale
-// context's flag word; the dispatch hook stamps the arbitration tick and extracts
-// an upscale dispatch's guides/geometry. The recording/insertion calls are Task 6
+// context's flag word; the dispatch hook stamps the arbitration tick, runs the
+// source claim (Task 5) and extracts an upscale dispatch's guides/geometry. The
+// recording/insertion calls are Task 6
 // (see the OnFfxDispatch body for where they land). Per the spec's threading
 // section: ffxDispatch may be reached from another thread than the evaluates
 // (frame generation plausibly on its own), so the tick stamps are relaxed
@@ -105,6 +106,12 @@ inline void OnFfxDispatch(void* command_list,
     if (ffx_probe::UpscaleInputs(d, &in)) {
       ffx_probe::OnUpscaleGeometry(*d, in);
       last_inputs = in;  // stamped: the extraction path ran to completion
+      // The claim: an upscale dispatch is classified (stamp first, then claim from it,
+      // the ordering PreparePass shows for DLSS). Called on this hook's thread -- the
+      // dispatch thread, the mirror of the evaluate thread that claims DLSS. Arbitration
+      // decides (SourceChoice): this can still return without claiming when Force
+      // standalone wins or a fresh DLSS outranks the FSR stamp.
+      nr_runner::OnFsrDispatchClaim(GetTickCount64());
     }
     if (n <= kFullDumps)
       ngx_probe::Logf(

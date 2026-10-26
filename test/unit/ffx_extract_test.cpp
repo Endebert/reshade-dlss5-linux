@@ -18,6 +18,15 @@ ULONGLONG GetTickCount64() {
   return ++t;
 }
 
+// The dispatch hook's source claim (nr_runner::OnFsrDispatchClaim) is reachable from
+// nr_fsr::OnFfxDispatch, so RetireFeature's Drop/StandaloneIdle bodies link even though
+// every test claim runs with no feature to retire (RetireFeature early-returns) and
+// never touches a fence. Bodies the mock declares but never defined: never called.
+DWORD WaitForSingleObject(HANDLE, DWORD) { return 0; }
+UINT64 ID3D12Fence::GetCompletedValue() const { return 0; }
+HRESULT ID3D12Fence::SetEventOnCompletion(UINT64, HANDLE) { return 0; }
+void ID3D12Resource::Release() {}
+
 namespace {
 
 namespace ffx = ffx_api;
