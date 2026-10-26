@@ -149,6 +149,7 @@ void TestNonUpscaleDispatchTicksWithoutExtracting() {
   d.header.type = FFX_API_MAKE_EFFECT_SUB_ID(FFX_API_EFFECT_ID_FRAMEGENERATION, 0x01);
 
   nr_runner::s.last_fsr_tick.store(0, std::memory_order_relaxed);
+  nr_fsr::last_inputs = {};  // reset so the negative asserts below are order-independent
   nr_fsr::OnFfxDispatch(d.commandList, &d.header);
 
   // Ticked: the arbitration stamp now sees this dispatch...
@@ -174,6 +175,10 @@ void TestUpscaleDispatchClassifiesAndExtracts() {
 }
 
 }  // namespace fsr
+
+// Note: nr_fsr's "logs the first 3 dispatches" gating (src/nr_fsr.hpp, `static uint32_t n`)
+// is diagnostic-only and is not asserted here -- it is verified by `bash build.sh` compilation
+// plus the in-game first-dispatch dumps (plan Task 6), not by this unit test.
 
 int main() {
   TestExtractFromUpscaleDispatch();
