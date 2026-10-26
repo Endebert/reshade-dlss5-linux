@@ -180,6 +180,52 @@ void TestUpscaleDispatchClassifiesAndExtracts() {
 // is diagnostic-only and is not asserted here -- it is verified by `bash build.sh` compilation
 // plus the in-game first-dispatch dumps (plan Task 6), not by this unit test.
 
+// --- Task 4 additions: source arbitration (SourceChoice) ----------------------
+
+namespace arb {
+
+// Shared clock base for the arbiter cases: a fresh stamp is `now - 1`, a stale
+// one older than both quiet windows (kDlssQuietMs == kFsrQuietMs == 3000).
+constexpr ULONGLONG kNow = 100000;
+constexpr ULONGLONG kFresh = kNow - 1;
+constexpr ULONGLONG kStale = kNow - 4000;
+
+// 7. Auto: dlss fresh, fsr fresh -> kSrcDlss (priority dlss > fsr).
+//    Auto: dlss stale, fsr fresh -> kSrcFsr.
+//    Auto: both stale, within arm -> -1 (standalone not armed yet).
+//    Force FSR3 with fresh dlss -> kSrcFsr (force beats priority).
+//    Force DLSS with only fsr fresh -> -1 (pass never runs).
+void TestArbiterPriorityAndForces() {
+  using nr_runner::SourceChoice;
+  assert(SourceChoice(kNow, kFresh, kFresh, nr_runner::kFsAuto) == nr_runner::kSrcDlss);
+  assert(SourceChoice(kNow, kStale, kFresh, nr_runner::kFsAuto) == nr_runner::kSrcFsr);
+  // Both stale, still inside the 10 s standalone arm -> no source yet.
+  nr_runner::s.armed_tick = kNow;
+  assert(SourceChoice(kNow, kStale, kStale, nr_runner::kFsAuto) == -1);
+  // Arm elapsed -> standalone claims in Auto (the kStandaloneArmMs gate).
+  nr_runner::s.armed_tick = kNow - nr_runner::kStandaloneArmMs;
+  assert(SourceChoice(kNow, kStale, kStale, nr_runner::kFsAuto) == nr_runner::kSrcStandalone);
+  nr_runner::s.armed_tick = 0;  // restore for later tests
+  // Force beats priority: Force FSR3 with a fresh DLSS stamp still picks FSR...
+  assert(SourceChoice(kNow, kFresh, kFresh, nr_runner::kFsFsr) == nr_runner::kSrcFsr);
+  // ...Force DLSS with only FSR fresh yields nothing (the pass never runs)...
+  assert(SourceChoice(kNow, kStale, kFresh, nr_runner::kFsDlss) == -1);
+  // ...and Force standalone claims regardless of activity or arm (the old Always).
+  assert(SourceChoice(kNow, 0, 0, nr_runner::kFsStandalone) == nr_runner::kSrcStandalone);
+}
+
+// Zero stamps mean "never seen" and never count as fresh, whatever the clock says.
+void TestZeroStampsNeverFresh() {
+  using nr_runner::SourceChoice;
+  assert(SourceChoice(kNow, 0, 0, nr_runner::kFsAuto) == -1);
+  assert(SourceChoice(kNow, 0, kFresh, nr_runner::kFsAuto) == nr_runner::kSrcFsr);
+  assert(SourceChoice(kNow, kFresh, 0, nr_runner::kFsAuto) == nr_runner::kSrcDlss);
+  assert(SourceChoice(kNow, 0, kFresh, nr_runner::kFsDlss) == -1);
+  assert(SourceChoice(kNow, 0, 0, nr_runner::kFsFsr) == -1);
+}
+
+}  // namespace arb
+
 int main() {
   TestExtractFromUpscaleDispatch();
   TestRejectsNonUpscaleDispatch();
@@ -187,6 +233,8 @@ int main() {
   fsr::TestCreateContextCapturesUpscaleFlags();
   fsr::TestNonUpscaleDispatchTicksWithoutExtracting();
   fsr::TestUpscaleDispatchClassifiesAndExtracts();
+  arb::TestArbiterPriorityAndForces();
+  arb::TestZeroStampsNeverFresh();
   std::printf("ffx_extract_test: all asserts passed\n");
   return 0;
 }

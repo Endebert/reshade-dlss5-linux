@@ -281,6 +281,16 @@ inline NVSDK_NGX_Result NVSDK_CONV HookD3D12EvaluateFeature(
   // none of its semantics. Before the first SR create has been seen (sr_handle null) every
   // evaluate counts, and the pass stays out anyway behind the no-DLSS-session gate.
   const bool sr = sr_handle == nullptr || handle == sr_handle;
+  // Force FSR3: hard gate -- the pass never runs in DLSS evaluates (what old Off meant).
+  // One-time log (spec): the first entry only, never silently.
+  if (nr_runner::s.frame_source == nr_runner::kFsFsr) {
+    static bool forced_logged = false;
+    if (!forced_logged) {
+      forced_logged = true;
+      Log("nr-fwd: FSR3 session forced \u2014 DLSS evaluates ignored");
+    }
+    return real_D3D12_EvaluateFeature(cmd_list, handle, params, callback);
+  }
   // Model resolution Render: enhance the color input before the game's DLSS-SR upscales it, on
   // this same command list, so recording order is the execution order. Upscaled runs the pass
   // after the evaluate instead, on the success path below.

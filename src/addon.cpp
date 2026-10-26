@@ -283,6 +283,24 @@ float Clamp(float v, float min, float max) { return v < min ? min : (v > max ? m
 void LoadSettings() {
   auto& s = nr_runner::s;
 
+  // StandaloneMode -> FrameSource migration (spec: same pattern as the encoding-6 one).
+  // The new key wins whenever present; only when it is absent and the legacy key exists is
+  // the legacy value translated (0 Auto -> 0, 1 Always -> 3 Force standalone, 2 Off -> 1
+  // Force DLSS), written under the new name and the old key deleted. Neither -> kFsAuto.
+  if (!reshade::get_config_value(nullptr, kConfigSection, "FrameSource", s.frame_source)) {
+    int legacy = -1;
+    if (reshade::get_config_value(nullptr, kConfigSection, "StandaloneMode", legacy)) {
+      s.frame_source = legacy == 1 ? nr_runner::kFsStandalone
+                                   : legacy == 2 ? nr_runner::kFsDlss : nr_runner::kFsAuto;
+      reshade::set_config_value(nullptr, kConfigSection, "FrameSource", s.frame_source);
+      reshade::set_config_value(nullptr, kConfigSection, "StandaloneMode",
+                                static_cast<const char*>(nullptr));
+    } else {
+      s.frame_source = nr_runner::kFsAuto;
+    }
+  }
+  if (s.frame_source < 0 || s.frame_source > nr_runner::kFsStandalone) s.frame_source = 0;
+
   // Pre-mirror keys, read first so the new names win when both exist.
   reshade::get_config_value(nullptr, kConfigSection, "Intensity", s.intensity);
   reshade::get_config_value(nullptr, kConfigSection, "StructureIntensity", s.local_structure);
@@ -291,7 +309,6 @@ void LoadSettings() {
 
   reshade::get_config_value(nullptr, kConfigSection, "DirectNeuralRenderingEncoding", s.encoding);
   reshade::get_config_value(nullptr, kConfigSection, "DirectNeuralRenderingPassCount", s.pass_count);
-  reshade::get_config_value(nullptr, kConfigSection, "StandaloneMode", s.standalone_mode);
   int model_resolution = nr_runner::kResFull;
   reshade::get_config_value(nullptr, kConfigSection, "ModelResolution", model_resolution);
   if (model_resolution != nr_runner::kResRender) model_resolution = nr_runner::kResFull;
@@ -357,7 +374,6 @@ void LoadSettings() {
   if (s.curve < 0 || s.curve > nr_runner::kCurveReinhard) s.curve = nr_runner::kCurveKnee;
   if (s.preset < 0 || s.preset > 7) s.preset = 0;
   if (s.pass_count < 1 || s.pass_count > nr_runner::kMaxPasses) s.pass_count = 1;
-  if (s.standalone_mode < 0 || s.standalone_mode > nr_runner::kSaOff) s.standalone_mode = 0;
   if (s.style < 0 || s.style > 2) s.style = 0;
 }
 
@@ -365,7 +381,7 @@ void SaveSettings() {
   auto& s = nr_runner::s;
   reshade::set_config_value(nullptr, kConfigSection, "DirectNeuralRenderingEncoding", s.encoding);
   reshade::set_config_value(nullptr, kConfigSection, "DirectNeuralRenderingPassCount", s.pass_count);
-  reshade::set_config_value(nullptr, kConfigSection, "StandaloneMode", s.standalone_mode);
+  reshade::set_config_value(nullptr, kConfigSection, "FrameSource", s.frame_source);
   reshade::set_config_value(nullptr, kConfigSection, "ModelResolution",
                             s.model_resolution.load(std::memory_order_relaxed));
   reshade::set_config_value(nullptr, kConfigSection, "DirectNeuralRenderingDiffuseWhiteNits",
@@ -403,6 +419,9 @@ void SaveSettings() {
   reshade::set_config_value(nullptr, kConfigSection, "GlobalIntensity",
                             static_cast<const char*>(nullptr));
   reshade::set_config_value(nullptr, kConfigSection, "Style",
+                            static_cast<const char*>(nullptr));
+  // Retired StandaloneMode, so a hand-restored copy cannot override FrameSource on load.
+  reshade::set_config_value(nullptr, kConfigSection, "StandaloneMode",
                             static_cast<const char*>(nullptr));
 }
 
@@ -480,13 +499,18 @@ void OnDrawOverlay(reshade::api::effect_runtime*) {
   {
     const int source = s.source.load(std::memory_order_relaxed);
     const char* source_name = source == nr_runner::kSrcDlss         ? "the game's DLSS session"
+                              : source == nr_runner::kSrcFsr        ? "the game's FSR3 session"
                               : source == nr_runner::kSrcStandalone ? "standalone"
                                                                     : "waiting for a frame";
     ImGui::Text("Source: %s", source_name);
-    bridge |= Combo("Standalone##mode", &s.standalone_mode, "Auto\0Always\0Off\0", 0,
-                    "For D3D12 games without DLSS: run off the back buffer, ReShade's depth "
-                    "(Generic Depth) and iMMERSE Launchpad's motion vectors, with no bridge.\n"
-                    "Auto runs it only when the game has no DLSS of its own.");
+    bridge |= Combo("Source##frame", &s.frame_source,
+                    "Auto\0Force DLSS\0Force FSR3\0Force standalone\0", 0,
+                    "Which session feeds the model: Auto walks the priority DLSS -> FSR3 -> "
+                    "standalone (a DLSS evaluate or FSR3 dispatch within the last 3 s claims "
+                    "the frame; standalone arms 10 s after start when neither showed up).\n"
+                    "Force DLSS runs only in the game's DLSS session, Force FSR3 only on FSR3 "
+                    "dispatches (the game's DLSS and standalone are ignored), Force standalone "
+                    "is the frame-by-frame source regardless.");
     if (s.sa_status[0] != 0 && source != nr_runner::kSrcDlss)
       ImGui::TextDisabled("Standalone: %s", s.sa_status);
   }
@@ -500,6 +524,9 @@ void OnDrawOverlay(reshade::api::effect_runtime*) {
         "much cheaper, at some loss of fine detail.\n"
         "In a game with DLSS: the frame before DLSS upscales it, at your DLSS preset's render "
         "resolution; DLSS then smooths some of the detail the model adds.\n"
+        "In a game with FSR3: Render runs the model on FSR's color input at render resolution "
+        "and FSR then upscales the enhanced frame; Full runs it on FSR's output at display "
+        "resolution.\n"
         "In standalone: applies when the depth buffer is smaller than the screen (a game with a "
         "separate resolution or render scale setting); only the model's change is scaled up, so "
         "the UI stays sharp.");

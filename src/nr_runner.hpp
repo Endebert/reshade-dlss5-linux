@@ -294,7 +294,10 @@ struct State {
   std::atomic<int> source{0};                 // Source
   std::atomic<ULONGLONG> last_dlss_tick{0};   // last DLSS-SR evaluate seen (GetTickCount64)
   std::atomic<ULONGLONG> last_fsr_tick{0};    // last FSR3 upscale dispatch seen (GetTickCount64)
-  int standalone_mode = 0;         // 0 Auto, 1 Always, 2 Off
+  // Auto's standalone arm window anchor (0 = not armed yet): set on the first ask, so
+  // SourceChoice's kStandaloneArmMs wait starts where StandaloneAllowed's old `start` did.
+  std::atomic<ULONGLONG> armed_tick{0};
+  int frame_source = 0;           // FrameSource: 0 Auto, 1 Force DLSS, 2 Force FSR3, 3 Force standalone
   bool sa_flip_x = false, sa_flip_y = false;  // motion-vector direction, standalone only
   bool temporal = true;            // false resets the model's history every frame (diagnostic)
   ID3D12Resource* sa_frame = nullptr;  // UAV-capable copy of the back buffer
@@ -342,8 +345,10 @@ struct State {
 
 inline State s;
 
-enum Source : int { kSrcNone = 0, kSrcDlss = 1, kSrcStandalone = 2 };
-enum StandaloneMode : int { kSaAuto = 0, kSaAlways = 1, kSaOff = 2 };
+enum Source : int { kSrcNone = 0, kSrcDlss = 1, kSrcStandalone = 2, kSrcFsr = 3 };
+// The persisted picker (ini key FrameSource, was StandaloneMode): which session feeds the
+// frame. Force is a hard gate on the excluded hook bodies; Auto arbitrates per frame.
+enum FrameSource : int { kFsAuto = 0, kFsDlss = 1, kFsFsr = 2, kFsStandalone = 3 };
 // Model resolution: Full runs the model on the full-resolution frame; Render at the resolution
 // the game renders its scene at, where that is lower (cheaper; see each frame path).
 enum ModelResolution : int { kResFull = 0, kResRender = 1 };
@@ -1230,8 +1235,31 @@ inline void PreDlssEvaluate(ID3D12GraphicsCommandList* cmd, const NVSDK_NGX_Para
 // back buffer, ReShade's depth (Generic Depth) and a motion-vector effect's texture (iMMERSE
 // Launchpad). The addon then has to start NGX itself, which a DLSS game's own init does otherwise.
 
-constexpr ULONGLONG kDlssQuietMs = 3000;      // DLSS evaluates this recent keep standalone out
-constexpr ULONGLONG kStandaloneArmMs = 10000;  // Auto waits this long for a DLSS session first
+constexpr ULONGLONG kDlssQuietMs = 3000;      // DLSS evaluates this recent claim the DLSS session
+constexpr ULONGLONG kFsrQuietMs = 3000;       // FSR dispatches this recent claim the FSR3 session
+constexpr ULONGLONG kStandaloneArmMs = 10000;  // Auto waits this long for a DLSS/FSR session first
+
+// Per-frame source arbitration: pure in now/dlss/fsr/frame_source, except Auto's standalone
+// arm (s.armed_tick, whose anchor the standalone gate sets). Force returns exactly its source
+// or -1 -- a hard gate, never a maybe; Auto walks the maintainer's priority dlss -> fsr ->
+// standalone, each stamp strictly inside its quiet window (0 = never seen, never fresh), and
+// standalone only once armed. A timing argument per frame, not an enforced invariant: callers
+// reach it from different threads with relaxed-atomic stamps.
+inline int SourceChoice(ULONGLONG now, ULONGLONG dlss, ULONGLONG fsr, int frame_source) {
+  const bool dlss_fresh = dlss != 0 && now - dlss < kDlssQuietMs;
+  const bool fsr_fresh = fsr != 0 && now - fsr < kFsrQuietMs;
+  switch (frame_source) {
+    case kFsDlss: return dlss_fresh ? kSrcDlss : -1;
+    case kFsFsr: return fsr_fresh ? kSrcFsr : -1;
+    case kFsStandalone: return kSrcStandalone;  // the old Always: no quiet window, no arm
+    default: break;  // kFsAuto (hand-edited junk is range-validated at load)
+  }
+  if (dlss_fresh) return kSrcDlss;
+  if (fsr_fresh) return kSrcFsr;
+  const ULONGLONG armed = s.armed_tick.load(std::memory_order_relaxed);
+  if (armed != 0 && now - armed >= kStandaloneArmMs) return kSrcStandalone;
+  return -1;
+}
 
 using PFN_D3D12InitExt = int(__cdecl*)(unsigned long long, const wchar_t*, ID3D12Device*, int,
                                        const NVSDK_NGX_Parameter*);
@@ -1343,39 +1371,64 @@ inline bool EnsureStandaloneFrame(ID3D12GraphicsCommandList* cmd, ID3D12Resource
   return true;
 }
 
-// Whether standalone may run now, with the reason kept for the overlay.
+// Whether standalone may run now, with the reason kept for the overlay. The source
+// arbitration itself is SourceChoice's; this adds standalone's own preconditions (the
+// bridge, a resident nvngx_dlss.dll, the arm window's anchor) and the status strings.
 inline bool StandaloneAllowed() {
-  static const ULONGLONG start = GetTickCount64();
   const ULONGLONG now = GetTickCount64();
-  if (s.standalone_mode == kSaOff) {
-    std::snprintf(s.sa_status, sizeof(s.sa_status), "off");
+  // The arm window starts on the first ask, as StandaloneAllowed's old `start` did; the
+  // choice below (and Force standalone's bypass of it) reads this anchor.
+  ULONGLONG armed = s.armed_tick.load(std::memory_order_relaxed);
+  if (armed == 0) {
+    s.armed_tick.store(armed = now, std::memory_order_relaxed);
+  }
+  const int fs = s.frame_source;
+  // Hard gates: the excluded hooks' bodies stay inert, so their stamps never arrive
+  // either -- Force DLSS/FSR3 means standalone never arms (what old Off meant, for both).
+  if (fs == kFsDlss || fs == kFsFsr) {
+    std::snprintf(s.sa_status, sizeof(s.sa_status), "off (source forced to %s)",
+                  fs == kFsDlss ? "DLSS" : "FSR3");
     return false;
   }
   const ULONGLONG last_dlss = s.last_dlss_tick.load(std::memory_order_relaxed);
-  if (last_dlss != 0 && now - last_dlss < kDlssQuietMs) {
-    std::snprintf(s.sa_status, sizeof(s.sa_status), "standing by: a DLSS session is the source");
+  const ULONGLONG last_fsr = s.last_fsr_tick.load(std::memory_order_relaxed);
+  // The old Always: no bridge/nvngx/arm checks, but a fresh session still owns the frame
+  // (the quiet check old kSaAlways already had, its FSR3 twin added). Walked through
+  // SourceChoice's Auto ordering purely for that freshness; Force never reads the arm.
+  if (fs == kFsStandalone) {
+    const int c = SourceChoice(now, last_dlss, last_fsr, kFsAuto);
+    if (c == kSrcDlss || c == kSrcFsr) {
+      std::snprintf(s.sa_status, sizeof(s.sa_status), "standing by: a %s session is the source",
+                    c == kSrcDlss ? "DLSS" : "FSR3");
+      return false;
+    }
+    return true;
+  }
+  const int choice = SourceChoice(now, last_dlss, last_fsr, fs);
+  if (choice == kSrcDlss || choice == kSrcFsr) {
+    std::snprintf(s.sa_status, sizeof(s.sa_status), "standing by: a %s session is the source",
+                  choice == kSrcDlss ? "DLSS" : "FSR3");
     return false;
   }
-  if (s.standalone_mode == kSaAuto) {
-    if (GetModuleHandleA("dlss5-bridge.addon64") != nullptr) {
-      std::snprintf(s.sa_status, sizeof(s.sa_status),
-                    "standing by: dlss5-bridge is installed and feeds this add-on");
-      return false;
-    }
-    // nvngx_dlss.dll resident before standalone started NGX means the game loaded it; after
-    // that, standalone's own NGX init may have loaded it, so it says nothing.
-    if (last_dlss != 0 ||
-        (s.ngx_core == nullptr && GetModuleHandleA("nvngx_dlss.dll") != nullptr)) {
-      std::snprintf(s.sa_status, sizeof(s.sa_status),
-                    "standing by: this game has DLSS (set Standalone to Always to force it)");
-      return false;
-    }
-    if (now - start < kStandaloneArmMs) {
-      std::snprintf(s.sa_status, sizeof(s.sa_status), "waiting for a DLSS session first");
-      return false;
-    }
+  // Auto from here. These come before the arm the way StandaloneAllowed always ordered
+  // them: a bridge or a DLSS-loaded game blocks standalone outright, not merely for the
+  // arm window.
+  if (GetModuleHandleA("dlss5-bridge.addon64") != nullptr) {
+    std::snprintf(s.sa_status, sizeof(s.sa_status),
+                  "standing by: dlss5-bridge is installed and feeds this add-on");
+    return false;
   }
-  return true;
+  // nvngx_dlss.dll resident before standalone started NGX means the game loaded it; after
+  // that, standalone's own NGX init may have loaded it, so it says nothing.
+  if (s.last_dlss_tick.load(std::memory_order_relaxed) != 0 ||
+      (s.ngx_core == nullptr && GetModuleHandleA("nvngx_dlss.dll") != nullptr)) {
+    std::snprintf(s.sa_status, sizeof(s.sa_status),
+                  "standing by: this game has DLSS (set Source to Force standalone to force it)");
+    return false;
+  }
+  if (choice == kSrcStandalone) return true;  // both quiet, arm window elapsed
+  std::snprintf(s.sa_status, sizeof(s.sa_status), "waiting for a DLSS or FSR3 session first");
+  return false;
 }
 
 // The game's queue (or, for D3D11, its context) waits on the GPU for each standalone frame. If

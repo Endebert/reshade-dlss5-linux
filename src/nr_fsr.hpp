@@ -23,8 +23,9 @@
 // Host unit-test build (test/unit/ffx_extract_test.cpp): no ngx_probe.hpp -- its
 // real body needs <windows.h>/<detours.h>. ffx_mock.hpp already declared
 // ngx_probe::Logf and friends declaration-only; what the test links is the
-// no-op body below, called only through the nr_fsr paths the test exercises.
+// no-op bodies below, called only through the nr_fsr paths the test exercises.
 namespace ngx_probe {
+inline void Log(const char*) {}
 inline void Logf(const char*, ...) {}
 }  // namespace ngx_probe
 #else
@@ -79,6 +80,18 @@ inline void OnFfxCreateContext(const ffx_api::ffxCreateContextDescHeader* header
 // per mode where the trampoline goes relative to them). Returns nothing.
 inline void OnFfxDispatch(void* command_list,
                           const ffx_api::ffxDispatchDescHeader* header) {
+  // Force DLSS: hard gate (spec's "the excluded hook bodies return immediately after the
+  // log line"). Not even the tick stamp -- Force DLSS means FSR is not the frame's source,
+  // so the arbitration stamp must not advance on dispatches nobody will act on; the gate is
+  // also what makes the one-time log line's condition stable.
+  if (nr_runner::s.frame_source == nr_runner::kFsDlss) {
+    static bool logged = false;
+    if (!logged) {
+      logged = true;
+      ngx_probe::Log("nr-fwd: DLSS session forced \u2014 FSR3 dispatches ignored");
+    }
+    return;
+  }
   nr_runner::s.last_fsr_tick.store(GetTickCount64(), std::memory_order_relaxed);
 
   static uint32_t count = 0;
