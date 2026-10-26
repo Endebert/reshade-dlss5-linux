@@ -78,9 +78,10 @@ inline void OnFfxCreateContext(const ffx_api::ffxCreateContextDescHeader* header
 
 // The ffxDispatch hook's head: tick first (arbitration reads the stamp), then
 // classify header->type -- any type ticks; the upscale type additionally
-// extracts. The recording/insertion calls are Task 6's: they belong right here,
-// after this extraction, against the same stack `in` (and the hook body decides
-// per mode where the trampoline goes relative to them). Returns nothing.
+// extracts. The recording/insertion calls (Task 6) are NOT here: they are the
+// separate PreRecord/PostRecord entry points below, each extracting into its own
+// stack `Inputs` in RecordPass, called from the hook body in ffx_api.hpp (which
+// decides per mode where the trampoline goes relative to them). Returns nothing.
 inline void OnFfxDispatch(void* command_list,
                           const ffx_api::ffxDispatchDescHeader* header) {
   // Force DLSS: hard gate (spec's "the excluded hook bodies return immediately after the

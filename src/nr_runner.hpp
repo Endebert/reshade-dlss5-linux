@@ -1178,9 +1178,21 @@ inline bool PreparePass(ID3D12GraphicsCommandList* cmd, const NVSDK_NGX_Paramete
 // retire_pending, the model-resolution swap that retires and skips a frame, the enabled
 // gate. The source is already claimed (OnFsrDispatchClaim, in the dispatch hook), so the
 // claim becomes a guard instead of a write: the pass runs for the FSR session only, never
-// for a DLSS session that won the arbitration while FSR dispatches kept ticking.
+// for a DLSS session that won the arbitration while FSR dispatches kept ticking. Both
+// gates -- the source guard and the Force DLSS / Force standalone frame_source force
+// gates -- sit at the very top, ahead of every shared-state mutation, so an excluded
+// path touches nothing (see the note at the gate).
 inline bool PrepareFsrPass(ID3D12GraphicsCommandList* cmd) {
   if (s.gave_up || cmd == nullptr) return false;
+  // Ownership and force gates FIRST, before any shared-state mutation below. This
+  // prologue runs on the dispatch thread while the present thread runs the same
+  // prefix in the standalone frame path -- under Force standalone with the game on
+  // FSR, every upscale dispatch would otherwise mutate the unlocked s.graveyard
+  // vector concurrently and double-consume retire_pending. Force DLSS / Force
+  // standalone exclude the recording path entirely (the spec's "excluded hook
+  // bodies return immediately"): no TickGraveyard, no retire, no resolution swap.
+  if (s.source.load(std::memory_order_relaxed) != kSrcFsr) return false;
+  if (s.frame_source == kFsDlss || s.frame_source == kFsStandalone) return false;
   if (s.dlss_out_w == 0 || s.dlss_out_h == 0) return false;  // no upscale geometry seen yet
 
   TickGraveyard();
@@ -1195,7 +1207,6 @@ inline bool PrepareFsrPass(ID3D12GraphicsCommandList* cmd) {
     return false;
   }
   if (!s.enabled) return false;
-  if (s.source.load(std::memory_order_relaxed) != kSrcFsr) return false;
 
   // Geometry handoff: OnUpscaleGeometry (dispatch hook) already stored this frame's
   // render/upscale sizes and color allocation into the dlss_* slots -- apply them the
