@@ -41,6 +41,19 @@ typedef ffxApiHeader ffxDispatchDescHeader;
 /// A pointer to a function that can receive messages from the runtime. May be null.
 typedef void (*ffxApiMessage)(uint32_t type, const wchar_t* message);
 
+// ffx_api.h FfxApiReturnCodes: the dispatch hook reads OK to decide whether the
+// Full-mode record may run (a failed dispatch left no output to record from).
+enum FfxApiReturnCodes : uint32_t {
+  FFX_API_RETURN_OK = 0,                      ///< The operation was successful.
+  FFX_API_RETURN_ERROR = 1,                   ///< An error that is not further specified.
+  FFX_API_RETURN_ERROR_UNKNOWN_DESCTYPE = 2,  ///< The structure type was not recognized.
+  FFX_API_RETURN_ERROR_RUNTIME_ERROR = 3,     ///< The runtime or effect reported an error.
+  FFX_API_RETURN_NO_PROVIDER = 4,             ///< No provider found for the structure type.
+  FFX_API_RETURN_ERROR_MEMORY = 5,            ///< A memory allocation failed.
+  FFX_API_RETURN_ERROR_PARAMETER = 6,         ///< A parameter was invalid.
+  FFX_API_RETURN_PROVIDER_NO_SUPPORT_NEW_DESCTYPE = 7,  ///< The provider is too old.
+};
+
 // The effect-identifier field of the type words; sub-ids live in the low bits.
 #define FFX_API_EFFECT_MASK 0x00ff0000u
 #define FFX_API_EFFECT_ID_UPSCALE 0x00010000u
@@ -92,6 +105,65 @@ struct FfxApiResource {
   void* resource;
   FfxApiResourceDescription description;
   uint32_t state;
+};
+
+// Resource types as FfxApiResourceDescription::type is filled by the SDK backends
+// (ffx_api_types.h FfxApiResourceType). The DX12 backend writes these from the
+// D3D12 resource desc; the description carries no backend/API field, so these
+// values are also the D3D12 sanity check on the Task 6 recording path.
+enum FfxApiResourceType : uint32_t {
+  FFX_API_RESOURCE_TYPE_BUFFER = 0,
+  FFX_API_RESOURCE_TYPE_TEXTURE1D = 1,
+  FFX_API_RESOURCE_TYPE_TEXTURE2D = 2,
+  FFX_API_RESOURCE_TYPE_TEXTURE_CUBE = 3,
+  FFX_API_RESOURCE_TYPE_TEXTURE3D = 4,
+};
+
+// Surface formats as FfxApiResourceDescription::format is filled (ffx_api_types.h
+// FfxApiSurfaceFormat): the DX12 backend maps DXGI_FORMAT onto these with
+// ffxApiGetSurfaceFormatDX12 (depth formats collapse to R32_FLOAT / R32_UINT, the
+// sRGB variants to *_SRGB). Enum order IS the wire value -- transcribed verbatim.
+enum FfxApiSurfaceFormat : uint32_t {
+  FFX_API_SURFACE_FORMAT_UNKNOWN = 0,
+  FFX_API_SURFACE_FORMAT_R32G32B32A32_TYPELESS = 1,
+  FFX_API_SURFACE_FORMAT_R32G32B32A32_UINT = 2,
+  FFX_API_SURFACE_FORMAT_R32G32B32A32_FLOAT = 3,
+  FFX_API_SURFACE_FORMAT_R16G16B16A16_FLOAT = 4,
+  FFX_API_SURFACE_FORMAT_R32G32B32_FLOAT = 5,
+  FFX_API_SURFACE_FORMAT_R32G32_FLOAT = 6,
+  FFX_API_SURFACE_FORMAT_R8_UINT = 7,
+  FFX_API_SURFACE_FORMAT_R32_UINT = 8,
+  FFX_API_SURFACE_FORMAT_R8G8B8A8_TYPELESS = 9,
+  FFX_API_SURFACE_FORMAT_R8G8B8A8_UNORM = 10,
+  FFX_API_SURFACE_FORMAT_R8G8B8A8_SNORM = 11,
+  FFX_API_SURFACE_FORMAT_R8G8B8A8_SRGB = 12,
+  FFX_API_SURFACE_FORMAT_B8G8R8A8_TYPELESS = 13,
+  FFX_API_SURFACE_FORMAT_B8G8R8A8_UNORM = 14,
+  FFX_API_SURFACE_FORMAT_B8G8R8A8_SRGB = 15,
+  FFX_API_SURFACE_FORMAT_R11G11B10_FLOAT = 16,
+  FFX_API_SURFACE_FORMAT_R10G10B10A2_UNORM = 17,
+  FFX_API_SURFACE_FORMAT_R16G16_FLOAT = 18,
+  FFX_API_SURFACE_FORMAT_R16G16_UINT = 19,
+  FFX_API_SURFACE_FORMAT_R16G16_SINT = 20,
+  FFX_API_SURFACE_FORMAT_R16_FLOAT = 21,
+  FFX_API_SURFACE_FORMAT_R16_UINT = 22,
+  FFX_API_SURFACE_FORMAT_R16_UNORM = 23,
+  FFX_API_SURFACE_FORMAT_R16_SNORM = 24,
+  FFX_API_SURFACE_FORMAT_R8_UNORM = 25,
+  FFX_API_SURFACE_FORMAT_R8G8_UNORM = 26,
+  FFX_API_SURFACE_FORMAT_R8G8_UINT = 27,
+  FFX_API_SURFACE_FORMAT_R32_FLOAT = 28,
+  FFX_API_SURFACE_FORMAT_R9G9B9E5_SHAREDEXP = 29,
+  FFX_API_SURFACE_FORMAT_R16G16B16A16_TYPELESS = 30,
+  FFX_API_SURFACE_FORMAT_R32G32_TYPELESS = 31,
+  FFX_API_SURFACE_FORMAT_R10G10B10A2_TYPELESS = 32,
+  FFX_API_SURFACE_FORMAT_R16G16_TYPELESS = 33,
+  FFX_API_SURFACE_FORMAT_R16_TYPELESS = 34,
+  FFX_API_SURFACE_FORMAT_R8_TYPELESS = 35,
+  FFX_API_SURFACE_FORMAT_R8G8_TYPELESS = 36,
+  FFX_API_SURFACE_FORMAT_R32_TYPELESS = 37,
+  FFX_API_SURFACE_FORMAT_R32G32_UINT = 38,
+  FFX_API_SURFACE_FORMAT_R8_SNORM = 39,
 };
 
 // --- ffx_upscale.h ---------------------------------------------------------
@@ -167,6 +239,9 @@ namespace ffx_probe {
 extern "C" bool UpscaleInputs(const ffx_api::ffxDispatchDescUpscale* d, nr_runner::Inputs* in);
 extern "C" void OnUpscaleGeometry(const ffx_api::ffxDispatchDescUpscale& d,
                                    const nr_runner::Inputs& in);
+// Task 6: the recording path's desc lookups (unit-tested in the host build).
+extern "C" DXGI_FORMAT OutputFormat(const ffx_api::FfxApiResourceDescription& desc);
+extern "C" bool IsD3d12TextureType(const ffx_api::FfxApiResourceDescription& desc);
 bool Install();
 void Uninstall();
 extern bool installed;
@@ -196,6 +271,7 @@ namespace ffx_probe {
 extern "C" inline bool UpscaleInputs(const ffx_api::ffxDispatchDescUpscale* d, nr_runner::Inputs* in) {
   if (d == nullptr || in == nullptr) return false;
   if (d->header.type != FFX_API_DISPATCH_DESC_TYPE_UPSCALE) return false;
+  in->color = static_cast<ID3D12Resource*>(d->color.resource);
   in->depth = static_cast<ID3D12Resource*>(d->depth.resource);
   in->motion = static_cast<ID3D12Resource*>(d->motionVectors.resource);
   in->output = static_cast<ID3D12Resource*>(d->output.resource);
@@ -230,6 +306,80 @@ extern "C" inline void OnUpscaleGeometry(const ffx_api::ffxDispatchDescUpscale& 
   (void)in;  // the extraction itself lands in Inputs; geometry is state only
 }
 
+// Task 6: output_format resolution -- FfxApiResourceDescription::format back to the
+// DXGI format the encoding decision keys off. The SDK's DX12 backend wrote it there
+// with ffxApiGetSurfaceFormatDX12; this is that map read in reverse (depth formats
+// arrive collapsed to R32_FLOAT/R32_UINT, the sRGB variants to *_SRGB -- the desc
+// says no more specific truth). Anything not listed (unknown, out of enum) resolves
+// to DXGI_FORMAT_UNKNOWN, the fallback Evaluate already handles: the frame's own
+// format beats a wrong guess.
+extern "C" inline DXGI_FORMAT OutputFormat(const ffx_api::FfxApiResourceDescription& desc) {
+  switch (desc.format) {
+    case ffx_api::FFX_API_SURFACE_FORMAT_R32G32B32A32_TYPELESS:
+      return DXGI_FORMAT_R32G32B32A32_TYPELESS;
+    case ffx_api::FFX_API_SURFACE_FORMAT_R32G32B32A32_UINT: return DXGI_FORMAT_R32G32B32A32_UINT;
+    case ffx_api::FFX_API_SURFACE_FORMAT_R32G32B32A32_FLOAT:
+      return DXGI_FORMAT_R32G32B32A32_FLOAT;
+    case ffx_api::FFX_API_SURFACE_FORMAT_R16G16B16A16_FLOAT:
+      return DXGI_FORMAT_R16G16B16A16_FLOAT;
+    case ffx_api::FFX_API_SURFACE_FORMAT_R32G32B32_FLOAT: return DXGI_FORMAT_R32G32B32_FLOAT;
+    case ffx_api::FFX_API_SURFACE_FORMAT_R32G32_FLOAT: return DXGI_FORMAT_R32G32_FLOAT;
+    case ffx_api::FFX_API_SURFACE_FORMAT_R8_UINT: return DXGI_FORMAT_R8_UINT;
+    case ffx_api::FFX_API_SURFACE_FORMAT_R32_UINT: return DXGI_FORMAT_R32_UINT;
+    case ffx_api::FFX_API_SURFACE_FORMAT_R8G8B8A8_TYPELESS: return DXGI_FORMAT_R8G8B8A8_TYPELESS;
+    case ffx_api::FFX_API_SURFACE_FORMAT_R8G8B8A8_UNORM: return DXGI_FORMAT_R8G8B8A8_UNORM;
+    case ffx_api::FFX_API_SURFACE_FORMAT_R8G8B8A8_SNORM: return DXGI_FORMAT_R8G8B8A8_SNORM;
+    case ffx_api::FFX_API_SURFACE_FORMAT_R8G8B8A8_SRGB: return DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+    case ffx_api::FFX_API_SURFACE_FORMAT_B8G8R8A8_TYPELESS: return DXGI_FORMAT_B8G8R8A8_TYPELESS;
+    case ffx_api::FFX_API_SURFACE_FORMAT_B8G8R8A8_UNORM: return DXGI_FORMAT_B8G8R8A8_UNORM;
+    case ffx_api::FFX_API_SURFACE_FORMAT_B8G8R8A8_SRGB: return DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
+    case ffx_api::FFX_API_SURFACE_FORMAT_R11G11B10_FLOAT: return DXGI_FORMAT_R11G11B10_FLOAT;
+    case ffx_api::FFX_API_SURFACE_FORMAT_R10G10B10A2_UNORM: return DXGI_FORMAT_R10G10B10A2_UNORM;
+    case ffx_api::FFX_API_SURFACE_FORMAT_R16G16_FLOAT: return DXGI_FORMAT_R16G16_FLOAT;
+    case ffx_api::FFX_API_SURFACE_FORMAT_R16G16_UINT: return DXGI_FORMAT_R16G16_UINT;
+    case ffx_api::FFX_API_SURFACE_FORMAT_R16G16_SINT: return DXGI_FORMAT_R16G16_SINT;
+    case ffx_api::FFX_API_SURFACE_FORMAT_R16_FLOAT: return DXGI_FORMAT_R16_FLOAT;
+    case ffx_api::FFX_API_SURFACE_FORMAT_R16_UINT: return DXGI_FORMAT_R16_UINT;
+    case ffx_api::FFX_API_SURFACE_FORMAT_R16_UNORM: return DXGI_FORMAT_R16_UNORM;
+    case ffx_api::FFX_API_SURFACE_FORMAT_R16_SNORM: return DXGI_FORMAT_R16_SNORM;
+    case ffx_api::FFX_API_SURFACE_FORMAT_R8_UNORM: return DXGI_FORMAT_R8_UNORM;
+    case ffx_api::FFX_API_SURFACE_FORMAT_R8G8_UNORM: return DXGI_FORMAT_R8G8_UNORM;
+    case ffx_api::FFX_API_SURFACE_FORMAT_R8G8_UINT: return DXGI_FORMAT_R8G8_UINT;
+    case ffx_api::FFX_API_SURFACE_FORMAT_R32_FLOAT: return DXGI_FORMAT_R32_FLOAT;
+    case ffx_api::FFX_API_SURFACE_FORMAT_R9G9B9E5_SHAREDEXP:
+      return DXGI_FORMAT_R9G9B9E5_SHAREDEXP;
+    case ffx_api::FFX_API_SURFACE_FORMAT_R16G16B16A16_TYPELESS:
+      return DXGI_FORMAT_R16G16B16A16_TYPELESS;
+    case ffx_api::FFX_API_SURFACE_FORMAT_R32G32_TYPELESS: return DXGI_FORMAT_R32G32_TYPELESS;
+    case ffx_api::FFX_API_SURFACE_FORMAT_R10G10B10A2_TYPELESS:
+      return DXGI_FORMAT_R10G10B10A2_TYPELESS;
+    case ffx_api::FFX_API_SURFACE_FORMAT_R16G16_TYPELESS: return DXGI_FORMAT_R16G16_TYPELESS;
+    case ffx_api::FFX_API_SURFACE_FORMAT_R16_TYPELESS: return DXGI_FORMAT_R16_TYPELESS;
+    case ffx_api::FFX_API_SURFACE_FORMAT_R8_TYPELESS: return DXGI_FORMAT_R8_TYPELESS;
+    case ffx_api::FFX_API_SURFACE_FORMAT_R8G8_TYPELESS: return DXGI_FORMAT_R8G8_TYPELESS;
+    case ffx_api::FFX_API_SURFACE_FORMAT_R32_TYPELESS: return DXGI_FORMAT_R32_TYPELESS;
+    case ffx_api::FFX_API_SURFACE_FORMAT_R32G32_UINT: return DXGI_FORMAT_R32G32_UINT;
+    case ffx_api::FFX_API_SURFACE_FORMAT_R8_SNORM: return DXGI_FORMAT_R8_SNORM;
+    default: return DXGI_FORMAT_UNKNOWN;
+  }
+}
+
+// Task 6: the D3D12 sanity check. FfxApiResourceDescription carries no backend/API
+// field; in a D3D12 game the DX12 backend is what fills it (DXGI-derived formats,
+// texture types taken from the D3D12 resource desc), so a texture type is the
+// cheapest positive proof the desc is D3D12-shaped -- the dispatch's color, output
+// and depth resources are always textures (a BUFFER type would be a broken desc).
+// Anything else: one bail-out line at the call site, dispatch passed through.
+extern "C" inline bool IsD3d12TextureType(const ffx_api::FfxApiResourceDescription& desc) {
+  switch (desc.type) {
+    case ffx_api::FFX_API_RESOURCE_TYPE_TEXTURE1D:
+    case ffx_api::FFX_API_RESOURCE_TYPE_TEXTURE2D:
+    case ffx_api::FFX_API_RESOURCE_TYPE_TEXTURE_CUBE:
+    case ffx_api::FFX_API_RESOURCE_TYPE_TEXTURE3D: return true;
+    default: return false;
+  }
+}
+
 }  // namespace ffx_probe
 
 // --- Detours installation (Task 2) ---------------------------------------------
@@ -253,6 +403,10 @@ extern "C" inline void OnUpscaleGeometry(const ffx_api::ffxDispatchDescUpscale& 
 namespace nr_fsr {
 inline void OnFfxCreateContext(const ffx_api::ffxCreateContextDescHeader* header);
 inline void OnFfxDispatch(void* command_list, const ffx_api::ffxDispatchDescHeader* header);
+// Task 6 recording halves (defined in nr_fsr.hpp): PreRecord runs before the
+// trampoline (model resolution Render), PostRecord after it (model resolution Full).
+inline void PreRecord(const ffx_api::ffxDispatchDescHeader* header);
+inline void PostRecord(const ffx_api::ffxDispatchDescHeader* header);
 }  // namespace nr_fsr
 
 namespace ffx_probe {
@@ -298,15 +452,24 @@ inline ffxReturnCode_t HookFfxDestroyContext(ffxContext* context,
 inline ffxReturnCode_t HookFfxDispatch(ffxContext* context,
                                        const ffx_api::ffxDispatchDescHeader* desc) {
   // Tick/classify/extract first (nr_fsr logs the first 3 dispatches), heartbeat,
-  // then the trampoline. Task 6 swaps the trampoline's place relative to its
-  // recording inside OnFfxDispatch's contract.
+  // then the Task 6 recording order around the trampoline: the ngx_probe evaluate
+  // hook's `pre` pattern copied verbatim (ngx_probe.hpp:297-301). Model resolution
+  // Render records into the upscale's color input first and the real dispatch then
+  // upscales the enhanced frame; model resolution Full runs the real dispatch first
+  // and records from its output. `pre` is decided before the record, so a model-
+  // resolution swap inside PrepareFsrPass lands on the next frame -- exactly how
+  // the DLSS path behaves when PreparePass swaps dlss_resolution.
   nr_fsr::OnFfxDispatch(context, desc);
   static uint32_t count = 0;
   const uint32_t n = ++count;
   if (n % kHeartbeatEvery == 0) {
     ngx_probe::Logf("ffx-probe: ffxDispatch #%u (alive)", n);
   }
-  return real_Dispatch(context, desc);
+  const bool pre = nr_runner::PreSr();
+  if (pre) nr_fsr::PreRecord(desc);
+  const ffxReturnCode_t r = real_Dispatch(context, desc);
+  if (!pre && r == ffx_api::FFX_API_RETURN_OK) nr_fsr::PostRecord(desc);
+  return r;
 }
 
 struct HookEntry {

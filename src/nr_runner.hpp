@@ -1167,6 +1167,56 @@ inline bool PreparePass(ID3D12GraphicsCommandList* cmd, const NVSDK_NGX_Paramete
   return true;
 }
 
+// The FSR variant of the shared prologue: ffxDispatch carries no NGX parameter block, so
+// the only differences from PreparePass are the ones that block provided (and its claim):
+// the game_params null-check is gone (nothing to read), and no last_dlss_tick stamp lands
+// here -- an FSR dispatch must not fake DLSS activity (the fresh-DLSS deferral in
+// OnFsrDispatchClaim reads that stamp honestly). Everything else is the same state
+// machine: same no-geometry gate (OnUpscaleGeometry, ffx_api.hpp, writes dlss_out_w/h from
+// the upscale dispatch's upscaleSize just as OnDlssCreate writes them from the NGX create,
+// so `0` still means "no upscale session geometry seen" for either source), graveyard tick,
+// retire_pending, the model-resolution swap that retires and skips a frame, the enabled
+// gate. The source is already claimed (OnFsrDispatchClaim, in the dispatch hook), so the
+// claim becomes a guard instead of a write: the pass runs for the FSR session only, never
+// for a DLSS session that won the arbitration while FSR dispatches kept ticking.
+inline bool PrepareFsrPass(ID3D12GraphicsCommandList* cmd) {
+  if (s.gave_up || cmd == nullptr) return false;
+  if (s.dlss_out_w == 0 || s.dlss_out_h == 0) return false;  // no upscale geometry seen yet
+
+  TickGraveyard();
+  if (s.retire_pending.exchange(false, std::memory_order_relaxed))
+    RetireFeature("model settings changed");
+  // Same swap as PreparePass, same one-frame skip: this dispatch's hook already chose
+  // pre/post from the old mode, the rebuilt feature starts through the new one next frame.
+  const int pending = s.model_resolution.load(std::memory_order_relaxed);
+  if (pending != s.dlss_resolution) {
+    s.dlss_resolution = pending;
+    RetireFeature("model resolution changed");
+    return false;
+  }
+  if (!s.enabled) return false;
+  if (s.source.load(std::memory_order_relaxed) != kSrcFsr) return false;
+
+  // Geometry handoff: OnUpscaleGeometry (dispatch hook) already stored this frame's
+  // render/upscale sizes and color allocation into the dlss_* slots -- apply them the
+  // way OnDlssCreate does for the DLSS source, and retire a feature built against
+  // anything else with OnDlssCreate's own PassW/PassH compare. Comparing after the
+  // handoff against feature_w/h (stamped at create), not against the old dlss_* --
+  // those were already overwritten by the extraction that followed this frame's
+  // dispatch. The model-resolution flip is handled by the swap above.
+  s.render_w = s.dlss_render_w;
+  s.render_h = s.dlss_render_h;
+  s.out_w = s.dlss_out_w;
+  s.out_h = s.dlss_out_h;
+  s.create_flags = s.dlss_create_flags;
+  if (s.feature != nullptr && (s.feature_w != PassW() || s.feature_h != PassH()))
+    RetireFeature("geometry changed");
+
+  if (!EnsureSetup(cmd)) return false;
+  if (!EnsureFeature(cmd)) return false;
+  return true;
+}
+
 // The game's DLSS guides are the model's guides in both modes: depth and motion vectors are
 // render-resolution in the game's parameter block either way.
 inline void ReadGuides(const NVSDK_NGX_Parameter* game_params, Inputs& in) {

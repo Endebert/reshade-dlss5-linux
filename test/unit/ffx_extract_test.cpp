@@ -56,9 +56,13 @@ void TestExtractFromUpscaleDispatch() {
   ffx::ffxDispatchDescUpscale d = MakeUpscaleDispatch();
   nr_runner::Inputs in = {};
   assert(ffx_probe::UpscaleInputs(&d, &in));
+  assert(in.color == reinterpret_cast<ID3D12Resource*>(0xC011));
   assert(in.depth == reinterpret_cast<ID3D12Resource*>(0xDE90));
   assert(in.motion == reinterpret_cast<ID3D12Resource*>(0xF00D));
   assert(in.output == reinterpret_cast<ID3D12Resource*>(0x007B));
+  // The color allocation the pass geometry keys off travels with the pointer
+  // (Task 6 records from in.color, PreDlssEvaluate-style).
+  assert(d.color.description.width == 1920 && d.color.description.height == 1080);
   assert(in.mv_scale_x == d.motionVectorScale.x);
   assert(in.mv_scale_y == d.motionVectorScale.y);
   assert(in.reset == d.reset);
@@ -119,6 +123,38 @@ void TestGeometryFollowsColorAllocation() {
   ffx::active_upscale_flags = 0;  // restore the pre-create default for later tests
 }
 
+// 3b (Task 6): output_format resolution -- the FFX surface-format enum (as the
+//    DX12 backend's ffxApiGetSurfaceFormatDX12 writes it into the resource
+//    description) maps back to the DXGI format the encode decision keys off.
+//    R8G8B8A8_UNORM_SRGB and B8G8R8A8_UNORM (DD2's swapchain family) are pinned
+//    exactly; unknown/out-of-enum formats resolve to UNKNOWN so Evaluate falls
+//    back to the frame's own format instead of a wrong encoding guess.
+void TestOutputFormatMapsFfxSurfaceFormat() {
+  ffx::FfxApiResourceDescription desc = {};
+  desc.format = ffx::FFX_API_SURFACE_FORMAT_R8G8B8A8_SRGB;
+  assert(ffx_probe::OutputFormat(desc) == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB);
+  desc.format = ffx::FFX_API_SURFACE_FORMAT_B8G8R8A8_UNORM;
+  assert(ffx_probe::OutputFormat(desc) == DXGI_FORMAT_B8G8R8A8_UNORM);
+  desc.format = ffx::FFX_API_SURFACE_FORMAT_UNKNOWN;
+  assert(ffx_probe::OutputFormat(desc) == DXGI_FORMAT_UNKNOWN);
+  desc.format = 0xFFFFFFFFu;  // out of enum: never a DXGI value by accident
+  assert(ffx_probe::OutputFormat(desc) == DXGI_FORMAT_UNKNOWN);
+}
+
+// 3c (Task 6): the resource-type sanity check -- the description's type enum is
+//    what the DX12 backend writes from the D3D12 resource desc (BUFFER=0,
+//    TEXTURE1D=1, TEXTURE2D=2, CUBE=3, TEXTURE3D=4); anything else means the
+//    desc did not come through a D3D12 backend and the pass must not touch it.
+void TestTextureTypeRecognized() {
+  ffx::FfxApiResourceDescription desc = {};
+  desc.type = ffx::FFX_API_RESOURCE_TYPE_TEXTURE2D;
+  assert(ffx_probe::IsD3d12TextureType(desc));
+  desc.type = ffx::FFX_API_RESOURCE_TYPE_BUFFER;
+  assert(!ffx_probe::IsD3d12TextureType(desc));
+  desc.type = 99;  // not an FfxApiResourceType value
+  assert(!ffx_probe::IsD3d12TextureType(desc));
+}
+
 }  // namespace
 
 
@@ -164,6 +200,7 @@ void TestNonUpscaleDispatchTicksWithoutExtracting() {
   // Ticked: the arbitration stamp now sees this dispatch...
   assert(nr_runner::s.last_fsr_tick.load(std::memory_order_relaxed) != 0);
   // ...but nothing was extracted: a non-upscale dispatch can never feed the pass.
+  assert(nr_fsr::last_inputs.color == nullptr);
   assert(nr_fsr::last_inputs.depth == nullptr);
   assert(nr_fsr::last_inputs.motion == nullptr);
   assert(nr_fsr::last_inputs.output == nullptr);
@@ -178,9 +215,13 @@ void TestUpscaleDispatchClassifiesAndExtracts() {
   nr_fsr::OnFfxDispatch(d.commandList, &d.header);
 
   assert(nr_runner::s.last_fsr_tick.load(std::memory_order_relaxed) != 0);
+  assert(nr_fsr::last_inputs.color == reinterpret_cast<ID3D12Resource*>(0xC011));
   assert(nr_fsr::last_inputs.depth == reinterpret_cast<ID3D12Resource*>(0xDE90));
   assert(nr_fsr::last_inputs.motion == reinterpret_cast<ID3D12Resource*>(0xF00D));
   assert(nr_fsr::last_inputs.output == reinterpret_cast<ID3D12Resource*>(0x007B));
+  // The color allocation reached the geometry state through the full dispatch path
+  // (OnUpscaleGeometry): the size PassW/PrepareFsrPass key off.
+  assert(nr_runner::s.color_in_w == 1920 && nr_runner::s.color_in_h == 1080);
 }
 
 }  // namespace fsr
@@ -247,6 +288,8 @@ int main() {
   TestExtractFromUpscaleDispatch();
   TestRejectsNonUpscaleDispatch();
   TestGeometryFollowsColorAllocation();
+  TestOutputFormatMapsFfxSurfaceFormat();
+  TestTextureTypeRecognized();
   fsr::TestCreateContextCapturesUpscaleFlags();
   fsr::TestNonUpscaleDispatchTicksWithoutExtracting();
   fsr::TestUpscaleDispatchClassifiesAndExtracts();
