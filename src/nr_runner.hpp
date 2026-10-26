@@ -22,6 +22,16 @@
 
 #pragma once
 
+// --- host-mock build ---------------------------------------------------------
+// NR_HOST_MOCK (test/unit/ffx_extract_test.cpp) compiles this header for a plain
+// Linux g++ unit test: every Windows/NGX/D3D12 include below is substituted with
+// minimal stand-ins from test/unit/ffx_mock.hpp -- declarations only, enough for
+// nr_runner's own translation unit to compile. The test never calls any of it, and a
+// function that is declared but never called contributes no code to the object, so
+// the absent bodies never reach the link. The real build never defines NR_HOST_MOCK
+// and sees this branch as one closed block -- zero impact.
+#ifndef NR_HOST_MOCK
+
 #include <windows.h>
 
 #include <bcrypt.h>
@@ -41,6 +51,19 @@
 
 #pragma comment(lib, "bcrypt")   // SHA-256 of the model DLL
 #pragma comment(lib, "version")  // its file-version resource
+
+#else  // NR_HOST_MOCK
+
+#include <atomic>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <vector>
+
+#include "../test/unit/ffx_mock.hpp"  // Win32/NGX/D3D12/compose stand-ins + ngx_probe loggers
+
+#endif  // NR_HOST_MOCK
 
 namespace nr_runner {
 
@@ -889,6 +912,10 @@ struct Inputs {
   ID3D12Resource* color = nullptr;
   ID3D12Resource* depth = nullptr;
   ID3D12Resource* motion = nullptr;
+  // The output resource of the source's own dispatch (FSR's ffxDispatchDescUpscale
+  // output): model resolution Full takes the frame from it after the trampoline.
+  // Written only by the FSR extraction; the DLSS/standalone paths leave it null.
+  ID3D12Resource* output = nullptr;
   float mv_scale_x = 1.0f, mv_scale_y = 1.0f;
   bool reset = false;
   bool depth_inverted = false;
