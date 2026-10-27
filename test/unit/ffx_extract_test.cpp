@@ -224,6 +224,28 @@ void TestUpscaleDispatchClassifiesAndExtracts() {
   assert(nr_runner::s.color_in_w == 1920 && nr_runner::s.color_in_h == 1080);
 }
 
+// 6b. Force DLSS hard gate: with frame_source == kFsDlss the dispatch hook returns
+//    before the arbitration stamp and before extraction -- last_fsr_tick stays 0 and
+//    last_inputs keeps nothing from this dispatch (the "excluded hook bodies return
+//    immediately" rule, in unit-test form).
+void TestForceDlssGateBlocksDispatch() {
+  ffx::ffxDispatchDescUpscale d = MakeUpscaleDispatch();
+  nr_runner::s.last_fsr_tick.store(0, std::memory_order_relaxed);
+  nr_fsr::last_inputs = {};  // deterministic baseline for the untouched asserts
+  const int prev_frame_source = nr_runner::s.frame_source;
+  nr_runner::s.frame_source = nr_runner::kFsDlss;
+
+  nr_fsr::OnFfxDispatch(d.commandList, &d.header);
+
+  assert(nr_runner::s.last_fsr_tick.load(std::memory_order_relaxed) == 0);
+  assert(nr_fsr::last_inputs.color == nullptr);
+  assert(nr_fsr::last_inputs.depth == nullptr);
+  assert(nr_fsr::last_inputs.motion == nullptr);
+  assert(nr_fsr::last_inputs.output == nullptr);
+
+  nr_runner::s.frame_source = prev_frame_source;  // restore for later tests
+}
+
 }  // namespace fsr
 
 // Note: nr_fsr's "logs the first 3 dispatches" gating (src/nr_fsr.hpp, `static uint32_t n`)
@@ -293,6 +315,7 @@ int main() {
   fsr::TestCreateContextCapturesUpscaleFlags();
   fsr::TestNonUpscaleDispatchTicksWithoutExtracting();
   fsr::TestUpscaleDispatchClassifiesAndExtracts();
+  fsr::TestForceDlssGateBlocksDispatch();
   arb::TestArbiterPriorityAndForces();
   arb::TestZeroStampsNeverFresh();
   std::printf("ffx_extract_test: all asserts passed\n");
