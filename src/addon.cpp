@@ -287,19 +287,23 @@ void LoadSettings() {
   // The new key wins whenever present; only when it is absent and the legacy key exists is
   // the legacy value translated (0 Auto -> 0, 1 Always -> 3 Force standalone, 2 Off -> 1
   // Force DLSS), written under the new name and the old key deleted. Neither -> kFsAuto.
-  if (!reshade::get_config_value(nullptr, kConfigSection, "FrameSource", s.frame_source)) {
+  // frame_source is a relaxed atomic (overlay writes, dispatch/evaluate/present reads),
+  // so the ini plumbing goes through a plain int and stores once at the end.
+  int frame_source = 0;
+  if (!reshade::get_config_value(nullptr, kConfigSection, "FrameSource", frame_source)) {
     int legacy = -1;
     if (reshade::get_config_value(nullptr, kConfigSection, "StandaloneMode", legacy)) {
-      s.frame_source = legacy == 1 ? nr_runner::kFsStandalone
-                                   : legacy == 2 ? nr_runner::kFsDlss : nr_runner::kFsAuto;
-      reshade::set_config_value(nullptr, kConfigSection, "FrameSource", s.frame_source);
+      frame_source = legacy == 1 ? nr_runner::kFsStandalone
+                                 : legacy == 2 ? nr_runner::kFsDlss : nr_runner::kFsAuto;
+      reshade::set_config_value(nullptr, kConfigSection, "FrameSource", frame_source);
       reshade::set_config_value(nullptr, kConfigSection, "StandaloneMode",
                                 static_cast<const char*>(nullptr));
     } else {
-      s.frame_source = nr_runner::kFsAuto;
+      frame_source = nr_runner::kFsAuto;
     }
   }
-  if (s.frame_source < 0 || s.frame_source > nr_runner::kFsStandalone) s.frame_source = 0;
+  if (frame_source < 0 || frame_source > nr_runner::kFsStandalone) frame_source = 0;
+  s.frame_source.store(frame_source, std::memory_order_relaxed);
 
   // Pre-mirror keys, read first so the new names win when both exist.
   reshade::get_config_value(nullptr, kConfigSection, "Intensity", s.intensity);
@@ -381,7 +385,8 @@ void SaveSettings() {
   auto& s = nr_runner::s;
   reshade::set_config_value(nullptr, kConfigSection, "DirectNeuralRenderingEncoding", s.encoding);
   reshade::set_config_value(nullptr, kConfigSection, "DirectNeuralRenderingPassCount", s.pass_count);
-  reshade::set_config_value(nullptr, kConfigSection, "FrameSource", s.frame_source);
+  reshade::set_config_value(nullptr, kConfigSection, "FrameSource",
+                            s.frame_source.load(std::memory_order_relaxed));
   reshade::set_config_value(nullptr, kConfigSection, "ModelResolution",
                             s.model_resolution.load(std::memory_order_relaxed));
   reshade::set_config_value(nullptr, kConfigSection, "DirectNeuralRenderingDiffuseWhiteNits",
@@ -503,7 +508,8 @@ void OnDrawOverlay(reshade::api::effect_runtime*) {
                               : source == nr_runner::kSrcStandalone ? "standalone"
                                                                     : "waiting for a frame";
     ImGui::Text("Source: %s", source_name);
-    bridge |= Combo("Source##frame", &s.frame_source,
+    int frame_source = s.frame_source.load(std::memory_order_relaxed);
+    Edit fs = Combo("Source##frame", &frame_source,
                     "Auto\0Force DLSS\0Force FSR3\0Force standalone\0", 0,
                     "Which session feeds the model: Auto walks the priority DLSS -> FSR3 -> "
                     "standalone (a DLSS evaluate or FSR3 dispatch within the last 3 s claims "
@@ -512,7 +518,14 @@ void OnDrawOverlay(reshade::api::effect_runtime*) {
                     "dispatches (the game's DLSS and standalone are ignored), Force standalone "
                     "runs every frame except while the game's own DLSS is actively evaluating "
                     "(it defers to a fresh DLSS session, not to FSR3).");
-    if (s.sa_status[0] != 0 && source != nr_runner::kSrcDlss)
+    bridge |= fs;  // the ini save below persists the picker
+    if (fs.changed || fs.committed)
+      s.frame_source.store(frame_source, std::memory_order_relaxed);
+    // sa_status is standalone-only (spec): show it while no session has claimed the
+    // frame -- kSrcNone keeps the pre-claim "waiting: ..." strings visible (they are
+    // written while the source is still kSrcNone) -- and once standalone owns it.
+    if (s.sa_status[0] != 0 &&
+        (source == nr_runner::kSrcNone || source == nr_runner::kSrcStandalone))
       ImGui::TextDisabled("Standalone: %s", s.sa_status);
   }
 
