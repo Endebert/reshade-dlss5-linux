@@ -1,21 +1,21 @@
 // FSR3 session source: the FFX create/dispatch event handlers the ffx_api.hpp hook
 // bodies call into. Counterpart of ngx_probe.hpp's DLSS hooks, same one-
-// responsibility split: nr_fsr consumes the Task 1 extractors (ffx_probe::
-// UpscaleInputs/OnUpscaleGeometry) and nr_runner's state, and ffx_api.hpp keeps
-// only the detour plumbing.
+// responsibility split: nr_fsr consumes ffx_probe's extractors (UpscaleInputs/
+// OnUpscaleGeometry) and nr_runner's state, and ffx_api.hpp keeps only the detour
+// plumbing.
 //
-// Task 3 scope: tick, classify, extract. The create hook captures the upscale
-// context's flag word; the dispatch hook stamps the arbitration tick, runs the
-// source claim (Task 5) and extracts an upscale dispatch's guides/geometry.
-// Task 6 scope: the recording around the trampoline -- PreRecord (model resolution
-// Render, before the real dispatch) and PostRecord (Full, after it), each extracting
-// from the same desc into a stack Inputs, running the FSR prologue and Evaluate.
-// Per the spec's threading
-// section: ffxDispatch may be reached from another thread than the evaluates
-// (frame generation plausibly on its own), so the tick stamps are relaxed
-// atomics, per-dispatch inputs live on this hook's stack for the invocation, and
-// a later dispatch's extraction overwrites nr_fsr::last_inputs (one observable
-// frame's worth -- never shared mutable state between concurrent dispatches).
+// Division of work, invariants: the create hook captures the upscale context's flag
+// word (only on a successful create); the dispatch hook stamps the arbitration tick
+// (unless Force DLSS excludes it), runs the source claim and extracts an upscale
+// dispatch's guides/geometry; the recording hooks -- PreRecord (model resolution
+// Render, before the real dispatch) and PostRecord (Full, after it) -- each extract
+// from the same desc into a stack Inputs and run the FSR prologue and Evaluate.
+// Per the spec's threading section: ffxDispatch may be reached from another thread
+// than the evaluates (frame generation plausibly on its own), so the tick stamps
+// are relaxed atomics, per-dispatch inputs live on this hook's stack for the
+// invocation, and a later dispatch's extraction overwrites nr_fsr::last_inputs
+// (one observable frame's worth -- never shared mutable state between concurrent
+// dispatches).
 
 #pragma once
 
@@ -42,9 +42,10 @@ inline void Logf(const char*, ...) {}
 
 namespace nr_fsr {
 
-// Set once an upscale create-context desc has been seen; the panel/status reads
-// it later (Task 4+) to tell "the game really created an FSR upscaler" apart from
-// "no FFX create yet". Inline: several TUs include this header.
+// Set once an upscale create-context desc has been seen (and successfully created);
+// the panel/status reads it to tell "the game really created an FSR upscaler" apart
+// from "no FFX create yet", and the record/claim gates use it as the session's
+// create-desc gate (see RecordPass). Inline: several TUs include this header.
 inline bool saw_upscale_create = false;
 
 // First-dispatch dump budget: the same 3 as ffx_probe::kFullDumps in the hook
@@ -78,10 +79,10 @@ inline void OnFfxCreateContext(const ffx_api::ffxCreateContextDescHeader* header
 
 // The ffxDispatch hook's head: tick first (arbitration reads the stamp), then
 // classify header->type -- any type ticks; the upscale type additionally
-// extracts. The recording/insertion calls (Task 6) are NOT here: they are the
-// separate PreRecord/PostRecord entry points below, each extracting into its own
-// stack `Inputs` in RecordPass, called from the hook body in ffx_api.hpp (which
-// decides per mode where the trampoline goes relative to them). Returns nothing.
+// extracts. The recording/insertion calls are NOT here: they are the separate
+// PreRecord/PostRecord entry points below, each extracting into its own stack
+// `Inputs` in RecordPass, called from the hook body in ffx_api.hpp (which decides
+// per mode where the trampoline goes relative to them). Returns nothing.
 inline void OnFfxDispatch(void* command_list,
                           const ffx_api::ffxDispatchDescHeader* header) {
   // Force DLSS: hard gate (spec's "the excluded hook bodies return immediately after the
@@ -107,14 +108,34 @@ inline void OnFfxDispatch(void* command_list,
   if (upscale) {
     const auto* d = reinterpret_cast<const ffx_api::ffxDispatchDescUpscale*>(header);
     if (ffx_probe::UpscaleInputs(d, &in)) {
+      // The desc-type gate, not context identity: see the create-desc gate below. This
+      // dispatch was made with an upscale desc, so geometry/extraction always land...
       ffx_probe::OnUpscaleGeometry(*d, in);
       last_inputs = in;  // stamped: the extraction path ran to completion
-      // The claim: an upscale dispatch is classified (stamp first, then claim from it,
-      // the ordering PreparePass shows for DLSS). Called on this hook's thread -- the
-      // dispatch thread, the mirror of the evaluate thread that claims DLSS. Arbitration
-      // decides (SourceChoice): this can still return without claiming when Force
-      // standalone wins or a fresh DLSS outranks the FSR stamp.
-      nr_runner::OnFsrDispatchClaim(GetTickCount64());
+      // ...but the claim (and, with it, running the pass at all) additionally requires
+      // that some upscale context create has been seen this session. Without it a
+      // dispatch arriving before our ffxCreateContext hook chain saw any create would
+      // claim FSR from geometry alone, and RecordPass would record with the flags of
+      // nothing (depth_inverted reading 0 off the not-yet-captured flag word) -- either
+      // from a context created before the hooks landed, or a loader/upscaler split
+      // where our create hook is not on the creating module's chain (see nr_fsr.hpp's
+      // create gate note). The claim: an upscale dispatch is classified (stamp first,
+      // then claim from it, the ordering PreparePass shows for DLSS). Called on this
+      // hook's thread -- the dispatch thread, the mirror of the evaluate thread that
+      // claims DLSS. Arbitration decides (SourceChoice): this can still return without
+      // claiming when Force DLSS gates above, Force standalone wins, or a fresh DLSS
+      // outranks the FSR stamp.
+      if (saw_upscale_create) {
+        nr_runner::OnFsrDispatchClaim(GetTickCount64());
+      } else {
+        static bool said = false;
+        if (!said) {
+          said = true;
+          ngx_probe::Log(
+              "nr-fwd: FSR3 dispatch before an upscale context was seen -- pass not run "
+              "(check which module ffxCreateContext was hooked on)");
+        }
+      }
     }
     if (n <= kFullDumps)
       ngx_probe::Logf(
@@ -127,7 +148,7 @@ inline void OnFfxDispatch(void* command_list,
   }
 }
 
-// --- Task 6: recording around the trampoline --------------------------------
+// --- recording around the trampoline -----------------------------------------
 //
 // Two entry points, one per model resolution, called from the hook body in
 // ffx_api.hpp (the ngx_probe evaluate hook's `pre` pattern): PreRecord before
@@ -136,24 +157,62 @@ inline void OnFfxDispatch(void* command_list,
 // block: type + D3D12 sanity check, extraction into a stack Inputs, the FSR
 // prologue (PrepareFsrPass -- ffxDispatch carries no parameter block), Evaluate.
 //
-// Barriers: none added here, deliberately. Evaluate's compose path owns every
-// transition of the resources it touches, on this same command list:
-// nr_compose::RecordPre enters assuming the frame resource is UAV, and for the
-// Render path Evaluate's own NON_PIXEL -> UAV entry barrier (top of Evaluate)
-// supplies exactly that -- the state FFX leaves its color input in after a
-// dispatch, and the state the DLSS paths start from too (RecordPre runs the same
-// for them). RecordPre's UAV -> COPY_SOURCE and RecordPost's restore back to UAV
-// (nr_compose.hpp, both bodies) close the bracket; RecordPost additionally hands
-// the frame back NON_PIXEL for the Render path (Evaluate's trailing barrier).
-// Depth and motion vectors are only read (model evaluate, debug views), never
-// transitioned -- identical to the DLSS session paths, which bind the same guides
-// straight out of the parameter block.
+// Barriers: none added here, deliberately -- and this is a DEVIATION from the spec's
+// original "the desc carries its current state; compose transitions in and restores"
+// mechanism, chosen deliberately:
+//   - FfxApiResource.state is never read. Its FfxApiResourceState bits are a FFX
+//     enum with its own values (COMMON = 1<<0, UNORDERED_ACCESS = 1<<1, ...
+//     RENDER_TARGET = 1<<8) that collide numerically with D3D12_RESOURCE_STATE_*
+//     (COMMON = 0, and the D3D12 bits carry the <<16 accumulation rule), so a
+//     naive passthrough of the word as a D3D12 state would silently barrier into
+//     wrong states; a real translation table would still be guessing what FFX's
+//     backend recorded as "current" after its own barriers.
+//   - What the pass actually needs is fixed, not desc-driven: RecordPre/UAV entry
+//     and the DLSS paths' NonPixel entry both begin from an assumed state. For the
+//     Render path Evaluate's own NON_PIXEL -> UAV entry barrier (top of Evaluate)
+//     supplies it -- the state FFX leaves its color input in after a dispatch, and
+//     the state the DLSS paths start from too (RecordPre runs the same for them).
+//     RecordPre's UAV -> COPY_SOURCE and RecordPost's restore back to UAV
+//     (nr_compose.hpp, both bodies) close the bracket; RecordPost additionally
+//     hands the frame back NON_PIXEL for the Render path (Evaluate's trailing
+//     barrier).
+//   - Depth and motion vectors are only read (model evaluate, debug views), never
+//     transitioned -- identical to the DLSS session paths, which bind the same
+//     guides straight out of the parameter block.
+// The assumption is the vkd3d-tolerant one this add-on already runs on (the
+// warn-and-write-anyway precedent for UAV flags); the in-game acceptance test is
+// what must confirm it: no barrier/validation warnings in the log and no
+// flicker/color corruption on the Render path's entry and Full path's write-back.
 #ifndef NR_HOST_MOCK
 
 // The shared recording half: desc checks, extraction, geometry from the caller.
 // `frame` is the dispatch's color resource (Render: the upscale input; Full: the
 // upscale output the pass writes back into).
 inline void RecordPass(const ffx_api::ffxDispatchDescUpscale* d, ID3D12Resource* frame) {
+  // Create-desc gate: only dispatches on a context created through our hook chain with
+  // an upscale create desc may run the pass (the spec's "context identity decides").
+  // Implemented as desc-type gate + session-wide saw_upscale_create rather than a
+  // context-handle -> desc map: full identity would need to key ffxCreateContext's
+  // opaque handle to its desc, but in practice the split is loader-hooked dispatches
+  // against an upscaler-created context -- and when both modules' exports are hooked,
+  // the same-process create still lands in our hook chain (Install attaches every
+  // export the target module provides, and is retried per present until both modules
+  // are covered), so the session-wide flag is the create side of the same fact. The
+  // flag word captured with it is what carries the real DEPTH_INVERTED state; before
+  // any create it would read 0, which is exactly the silent-wrong-depth this gate
+  // exists to prevent. Unknown contexts (created before our hooks, or a module we do
+  // not hook) therefore pass the dispatch through untouched -- the claim gate in
+  // OnFfxDispatch enforces the same rule, one log line earlier.
+  if (!saw_upscale_create) {
+    static bool said = false;
+    if (!said) {
+      said = true;
+      ngx_probe::Log(
+          "nr-fwd: FSR3 dispatch before an upscale context was seen -- pass not run "
+          "(check which module ffxCreateContext was hooked on)");
+    }
+    return;
+  }
   // D3D12 sanity check: FfxApiResourceDescription carries no backend/API field; a
   // texture type is what the DX12 backend writes from the D3D12 resource desc.
   // Not D3D12-shaped: one bail-out line, the dispatch passes through untouched.
