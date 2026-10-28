@@ -6,6 +6,7 @@
 
 #include <windows.h>
 
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -52,11 +53,44 @@ void LogWineVersion() {
   reshade::log::message(reshade::log::level::info, buf);
 }
 
+std::atomic_flag probe_install_busy = ATOMIC_FLAG_INIT;
+
+struct ProbeInstallGate {
+  const bool acquired = !probe_install_busy.test_and_set(std::memory_order_acquire);
+
+  ProbeInstallGate() = default;
+  ProbeInstallGate(const ProbeInstallGate&) = delete;
+  ProbeInstallGate& operator=(const ProbeInstallGate&) = delete;
+  ~ProbeInstallGate() {
+    if (acquired) probe_install_busy.clear(std::memory_order_release);
+  }
+};
+
+void TryInstallProbes(const char* stage, bool ngx, bool ffx) {
+  ProbeInstallGate gate;
+  if (!gate.acquired) return;
+  if (ngx) ngx_probe::TryInstall();
+  if (ffx && !ffx_probe::installed && ffx_probe::Install()) {
+    char buf[128];
+    std::snprintf(buf, sizeof(buf), "ffx-probe: attached at %s", stage);
+    reshade::log::message(reshade::log::level::info, buf);
+  }
+}
+
+void OnInitDevice(reshade::api::device* device) {
+  if (device->get_api() == reshade::api::device_api::d3d12) {
+    TryInstallProbes("init_device", false, true);
+  }
+}
+
 // get_resource_desc returns a large struct by value from a virtual method —
 // only ABI-safe because we build with clang targeting x86_64-pc-windows-msvc
 // (matching MSVC-built ReShade). A MinGW GCC build crashes on this call.
 void OnInitSwapchain(reshade::api::swapchain* swapchain, bool resize) {
   auto* device = swapchain->get_device();
+  if (device->get_api() == reshade::api::device_api::d3d12) {
+    TryInstallProbes("init_swapchain", false, true);
+  }
   const auto back_buffer = swapchain->get_back_buffer(0);
   const auto desc = device->get_resource_desc(back_buffer);
   const auto color_space = swapchain->get_color_space();
@@ -80,8 +114,7 @@ void OnInitSwapchain(reshade::api::swapchain* swapchain, bool resize) {
 void OnPresent(reshade::api::command_queue*, reshade::api::swapchain*,
                const reshade::api::rect*, const reshade::api::rect*,
                uint32_t, const reshade::api::rect*) {
-  ngx_probe::TryInstall();
-  ffx_probe::Install();  // idempotent, cheap when no FFX module is loaded yet
+  TryInstallProbes("present", true, true);
 
   // F10 toggles the NR pass, edge-triggered, for instant A/B comparison.
   static bool f10_was_down = false;
@@ -706,11 +739,12 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lp_reserved) {
                             "DLSSNR Linux loaded (clang x86_64-pc-windows-msvc, built on Linux)");
       LogWineVersion();
       LoadSettings();
+      reshade::register_event<reshade::addon_event::init_device>(OnInitDevice);
       reshade::register_event<reshade::addon_event::init_swapchain>(OnInitSwapchain);
       reshade::register_event<reshade::addon_event::present>(OnPresent);
       reshade::register_event<reshade::addon_event::reshade_render_technique>(OnRenderTechnique);
       reshade::register_overlay("DLSSNR Linux", OnDrawOverlay);
-      ngx_probe::TryInstall();  // in case NGX is already resident
+      TryInstallProbes("process_attach", true, false);  // in case NGX is already resident
       break;
     case DLL_PROCESS_DETACH:
       // Non-null lp_reserved: the process is terminating and every other
@@ -729,6 +763,7 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lp_reserved) {
       reshade::unregister_event<reshade::addon_event::reshade_render_technique>(OnRenderTechnique);
       reshade::unregister_event<reshade::addon_event::present>(OnPresent);
       reshade::unregister_event<reshade::addon_event::init_swapchain>(OnInitSwapchain);
+      reshade::unregister_event<reshade::addon_event::init_device>(OnInitDevice);
       reshade::unregister_addon(h_module);
       break;
   }

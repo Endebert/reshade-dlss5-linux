@@ -5,21 +5,13 @@
 #pragma once
 
 #include <stdint.h>
+#include <stddef.h>
+#include <atomic>
+#include <mutex>
+#include <unordered_map>
 
-// Build-mode contract, enforced rather than assumed: nr_runner.hpp picks between
-// the real Windows/NGX include block and the host source mock from NR_HOST_MOCK,
-// and that selection is pinned by the first of nr_runner.hpp / this header to be
-// included in a TU.
-//   - Real MSVC-targeted build: define nothing (exactly as before; the guard
-//     nr_runner.hpp installs only fires for non-Windows compilers).
-//   - Host g++ test build: `#define NR_HOST_MOCK` before the first of these two
-//     headers. A host compile that gets that wrong fails with an #error naming
-//     the contract (nr_runner.hpp) instead of an opaque missing <windows.h>.
-#include "nr_runner.hpp"  // nr_runner::Inputs / nr_runner::s — mode per the contract above
+#include "nr_runner.hpp"
 
-// If the contract above was violated, nr_runner.hpp has already reported it with
-// its #error; skip this header's body so that error is the only diagnostic.
-#ifndef NR_HOST_MODE_CONTRACT_ERROR
 
 // The SDK declares everything inside extern "C"; these are plain aggregates either
 // way, so the vendored slice is transcribed as C++ declarations inside a namespace.
@@ -107,10 +99,6 @@ struct FfxApiResource {
   uint32_t state;
 };
 
-// Resource types as FfxApiResourceDescription::type is filled by the SDK backends
-// (ffx_api_types.h FfxApiResourceType). The DX12 backend writes these from the
-// D3D12 resource desc; the description carries no backend/API field, so these
-// values are also the D3D12 sanity check on the recording path.
 enum FfxApiResourceType : uint32_t {
   FFX_API_RESOURCE_TYPE_BUFFER = 0,
   FFX_API_RESOURCE_TYPE_TEXTURE1D = 1,
@@ -119,10 +107,6 @@ enum FfxApiResourceType : uint32_t {
   FFX_API_RESOURCE_TYPE_TEXTURE3D = 4,
 };
 
-// Surface formats as FfxApiResourceDescription::format is filled (ffx_api_types.h
-// FfxApiSurfaceFormat): the DX12 backend maps DXGI_FORMAT onto these with
-// ffxApiGetSurfaceFormatDX12 (depth formats collapse to R32_FLOAT / R32_UINT, the
-// sRGB variants to *_SRGB). Enum order IS the wire value -- transcribed verbatim.
 enum FfxApiSurfaceFormat : uint32_t {
   FFX_API_SURFACE_FORMAT_UNKNOWN = 0,
   FFX_API_SURFACE_FORMAT_R32G32B32A32_TYPELESS = 1,
@@ -220,14 +204,13 @@ struct ffxDispatchDescUpscale {
   uint32_t flags;                     ///< Zero or a combination of FfxApiDispatchFsrUpscaleFlags.
 };
 
-// The create-context upscale flags captured by the ffxCreateContext hook (written
-// only on a successful create; read here by UpscaleInputs/OnUpscaleGeometry). Zero
-// until an upscale create desc has been seen, so before any upscale create every
-// FFX flag reads off. Declared only; the single inline definition is further down
-// (one entity across all TUs that include this header -- no ODR violation at link).
-extern uint32_t active_upscale_flags;
+extern std::atomic<uint32_t> active_upscale_flags;
 
 }  // namespace ffx_api
+
+namespace ffx_api {
+inline std::atomic<uint32_t> active_upscale_flags{0};
+}
 
 // --- probe interface ---------------------------------------------------------
 // Install/Uninstall own the detour lifecycle; nr_fsr.hpp drives the extraction.
@@ -236,9 +219,11 @@ namespace ffx_probe {
 // extern "C" so the test links the definitions at file scope in
 // this header by their unmangled names; the definitions below are inline as well --
 // the same ODR constraint as active_upscale_flags: several TUs include this header.
-extern "C" bool UpscaleInputs(const ffx_api::ffxDispatchDescUpscale* d, nr_runner::Inputs* in);
+extern "C" bool UpscaleInputs(const ffx_api::ffxDispatchDescUpscale* d, nr_runner::Inputs* in,
+                               uint32_t flags = ffx_api::active_upscale_flags);
 extern "C" void OnUpscaleGeometry(const ffx_api::ffxDispatchDescUpscale& d,
-                                   const nr_runner::Inputs& in);
+                                   const nr_runner::Inputs& in,
+                                   uint32_t flags = ffx_api::active_upscale_flags);
 // The recording path's desc lookups (unit-tested in the host build).
 extern "C" DXGI_FORMAT OutputFormat(const ffx_api::FfxApiResourceDescription& desc);
 extern "C" bool IsD3d12TextureType(const ffx_api::FfxApiResourceDescription& desc);
@@ -248,27 +233,43 @@ extern bool installed;
 
 }  // namespace ffx_probe
 
-// Flag word of the upscale context last created through the hooked ffxCreateContext;
-// zero until then, so every FFX flag reads off before any upscale create (the
-// ffxCreateContext hook writes it, next to the saw_upscale_create bookkeeping).
-namespace ffx_api {
-// inline: this header is included by more than one TU (the test and the hook code);
-// a non-inline definition here would be a multiple-definition link error.
-inline uint32_t active_upscale_flags = 0;
-}
-
-// --- extraction ----------------------------------------------------------------
-// Definitions live in ffx_probe next to their declarations: a non-inline
-// declaration in one scope and an inline definition in another is exactly the
-// declaration/definition mismatch that keeps the weak (emittable) copy from being
-// emitted; same scope, inline definition wins and every TU gets the symbol.
 namespace ffx_probe {
 
-// Pure: pulls the guides an upscale dispatch carries into the frame's Inputs. False
-// unless the dispatch desc is an upscale one, so a non-upscale dispatch (frame
-// generation, CAS, any other effect in the chain) can never feed the pass even if a
-// caller forgets to filter first.
-extern "C" inline bool UpscaleInputs(const ffx_api::ffxDispatchDescUpscale* d, nr_runner::Inputs* in) {
+struct UpscaleContext {
+  ffx_api::FfxApiDimensions2D max_upscale_size;
+  uint32_t flags;
+};
+inline std::atomic<uint32_t> dispatch_dumps{0};
+inline std::mutex context_mutex;
+inline std::unordered_map<void*, UpscaleContext> upscale_contexts;
+
+inline void RememberContext(void* context, const ffx_api::ffxCreateContextDescUpscale& desc) {
+  if (!context) return;
+  std::lock_guard<std::mutex> lock(context_mutex);
+  upscale_contexts[context] = {desc.maxUpscaleSize, desc.flags};
+  dispatch_dumps.store(0, std::memory_order_relaxed);
+}
+
+inline void ForgetContext(void* context) {
+  std::lock_guard<std::mutex> lock(context_mutex);
+  upscale_contexts.erase(context);
+}
+
+inline bool ResolveDispatch(void* context, const ffx_api::ffxDispatchDescUpscale& raw,
+                            ffx_api::ffxDispatchDescUpscale& resolved, UpscaleContext& info) {
+  resolved = raw;
+  info = {};
+  std::lock_guard<std::mutex> lock(context_mutex);
+  const auto it = upscale_contexts.find(context);
+  if (it == upscale_contexts.end()) return false;
+  info = it->second;
+  if (raw.upscaleSize.width == 0 && raw.upscaleSize.height == 0)
+    resolved.upscaleSize = info.max_upscale_size;
+  return resolved.upscaleSize.width != 0 && resolved.upscaleSize.height != 0;
+}
+
+extern "C" inline bool UpscaleInputs(const ffx_api::ffxDispatchDescUpscale* d, nr_runner::Inputs* in,
+                                      uint32_t flags) {
   if (d == nullptr || in == nullptr) return false;
   if (d->header.type != FFX_API_DISPATCH_DESC_TYPE_UPSCALE) return false;
   in->color = static_cast<ID3D12Resource*>(d->color.resource);
@@ -279,24 +280,18 @@ extern "C" inline bool UpscaleInputs(const ffx_api::ffxDispatchDescUpscale* d, n
   in->mv_scale_y = d->motionVectorScale.y;
   in->reset = d->reset;
   in->depth_inverted =
-      (ffx_api::active_upscale_flags & ffx_api::FFX_UPSCALE_ENABLE_DEPTH_INVERTED) != 0;
+      (flags & ffx_api::FFX_UPSCALE_ENABLE_DEPTH_INVERTED) != 0;
   return true;
 }
 
-// Pure state update: stores the geometry the pass runs at, following the DLSS
-// precedent OnDlssCreate established -- color_in from the color resource's full
-// allocation (a dynamic-resolution render inside a full-size resource still passes),
-// the render/upscale sizes into the dlss_* slots the source branch applies. The
-// DepthInverted bit (same value 1<<3 in both flag words) carries over so ReadGuides'
-// consumers see it; the other FFX create flags are not DLSS flags and stay unmapped.
 extern "C" inline void OnUpscaleGeometry(const ffx_api::ffxDispatchDescUpscale& d,
-                                        const nr_runner::Inputs& in) {
+                                        const nr_runner::Inputs& in, uint32_t flags) {
   nr_runner::s.dlss_render_w = d.renderSize.width;
   nr_runner::s.dlss_render_h = d.renderSize.height;
   nr_runner::s.dlss_out_w = d.upscaleSize.width;
   nr_runner::s.dlss_out_h = d.upscaleSize.height;
   const bool depth_inverted =
-      (ffx_api::active_upscale_flags & ffx_api::FFX_UPSCALE_ENABLE_DEPTH_INVERTED) != 0;
+      (flags & ffx_api::FFX_UPSCALE_ENABLE_DEPTH_INVERTED) != 0;
   if (depth_inverted)
     nr_runner::s.dlss_create_flags |= NVSDK_NGX_DLSS_Feature_Flags_DepthInverted;
   else
@@ -306,13 +301,6 @@ extern "C" inline void OnUpscaleGeometry(const ffx_api::ffxDispatchDescUpscale& 
   (void)in;  // the extraction itself lands in Inputs; geometry is state only
 }
 
-// output_format resolution -- FfxApiResourceDescription::format back to the
-// DXGI format the encoding decision keys off. The SDK's DX12 backend wrote it there
-// with ffxApiGetSurfaceFormatDX12; this is that map read in reverse (depth formats
-// arrive collapsed to R32_FLOAT/R32_UINT, the sRGB variants to *_SRGB -- the desc
-// says no more specific truth). Anything not listed (unknown, out of enum) resolves
-// to DXGI_FORMAT_UNKNOWN, the fallback Evaluate already handles: the frame's own
-// format beats a wrong guess.
 extern "C" inline DXGI_FORMAT OutputFormat(const ffx_api::FfxApiResourceDescription& desc) {
   switch (desc.format) {
     case ffx_api::FFX_API_SURFACE_FORMAT_R32G32B32A32_TYPELESS:
@@ -364,12 +352,6 @@ extern "C" inline DXGI_FORMAT OutputFormat(const ffx_api::FfxApiResourceDescript
   }
 }
 
-// The D3D12 sanity check. FfxApiResourceDescription carries no backend/API
-// field; in a D3D12 game the DX12 backend is what fills it (DXGI-derived formats,
-// texture types taken from the D3D12 resource desc), so a texture type is the
-// cheapest positive proof the desc is D3D12-shaped -- the dispatch's color, output
-// and depth resources are always textures (a BUFFER type would be a broken desc).
-// Anything else: one bail-out line at the call site, dispatch passed through.
 extern "C" inline bool IsD3d12TextureType(const ffx_api::FfxApiResourceDescription& desc) {
   switch (desc.type) {
     case ffx_api::FFX_API_RESOURCE_TYPE_TEXTURE1D:
@@ -382,31 +364,18 @@ extern "C" inline bool IsD3d12TextureType(const ffx_api::FfxApiResourceDescripti
 
 }  // namespace ffx_probe
 
-// --- Detours installation -------------------------------------------------------
-// The FFX API attach, shape-copied from ngx_probe::TryInstall/Uninstall: same
-// per-probe stale-detour marker (one marker per probe, so another image's leaked
-// detours block only its own probe), same blocked state, same all-or-nothing
-// transaction discipline. The hook bodies forward through real_* to nr_fsr's
-// handlers (dispatch carries the first-3-then-heartbeat line so the attach is
-// verifiable from the log).
-// NR_HOST_MOCK guard: the host unit-test build has neither <windows.h> nor
-// <detours.h>. The declarations above stay visible in both modes; only this
-// section compiles in the real build.
 #ifndef NR_HOST_MOCK
 
 #include "ngx_probe.hpp"  // Logf/Warnf + AttachedMarker (one marker per probe)
 
-// The hook bodies delegate to nr_fsr. Declared here rather than included: nr_fsr.hpp
-// includes this header for the vendored types, so including it back would close the
-// cycle. The only TU that compiles this section (addon.cpp) includes nr_fsr.hpp
-// alongside this header, so both inline definitions are in that TU before it ends.
 namespace nr_fsr {
-inline void OnFfxCreateContext(const ffx_api::ffxCreateContextDescHeader* header);
-inline void OnFfxDispatch(void* command_list, const ffx_api::ffxDispatchDescHeader* header);
+inline void OnFfxCreateContext(const ffx_api::ffxCreateContextDescHeader* header, void* context);
+inline void OnFfxDispatch(void* context, const ffx_api::ffxDispatchDescHeader* header,
+                          uint32_t flags);
 // The recording halves (defined in nr_fsr.hpp): PreRecord runs before the trampoline
 // (model resolution Render), PostRecord after it (model resolution Full).
-inline void PreRecord(const ffx_api::ffxDispatchDescHeader* header);
-inline void PostRecord(const ffx_api::ffxDispatchDescHeader* header);
+inline void PreRecord(const ffx_api::ffxDispatchDescHeader* header, uint32_t flags);
+inline void PostRecord(const ffx_api::ffxDispatchDescHeader* header, uint32_t flags);
 }  // namespace nr_fsr
 
 namespace ffx_probe {
@@ -416,10 +385,6 @@ namespace ffx_probe {
 // dispatch's resources and sizes.
 constexpr uint32_t kHeartbeatEvery = 600;
 
-// The exported entry points as ffx_api.h declares them: the context handle is
-// an opaque pointer, the return code a uint32_t. The allocation-callbacks
-// struct is only ever passed through to the real implementation, so it stays
-// incomplete here.
 using ffxContext = void*;
 using ffxReturnCode_t = uint32_t;
 struct ffxAllocationCallbacks;
@@ -431,45 +396,59 @@ static ffxReturnCode_t (*real_DestroyContext)(ffxContext*,
                                                const ffxAllocationCallbacks*) = nullptr;
 static ffxReturnCode_t (*real_Dispatch)(ffxContext*,
                                         const ffx_api::ffxDispatchDescHeader*) = nullptr;
-
-// Hook bodies: both forward through the trampoline. CreateContext records its desc
-// only when the real create succeeded (a failed create left no context whose flags
-// dispatches may trust -- mirroring the dispatch hook's r == FFX_API_RETURN_OK gate);
-// Dispatch classifies/extracts before it, heartbeat, then forwards -- and swaps where
-// the trampoline goes relative to its recording, per mode.
 inline ffxReturnCode_t HookFfxCreateContext(ffxContext* context,
                                             ffx_api::ffxCreateContextDescHeader* desc,
                                             const ffxAllocationCallbacks* memCb) {
   const ffxReturnCode_t r = real_CreateContext(context, desc, memCb);
-  if (r == ffx_api::FFX_API_RETURN_OK) nr_fsr::OnFfxCreateContext(desc);
+  if (r == ffx_api::FFX_API_RETURN_OK && context && *context)
+    nr_fsr::OnFfxCreateContext(desc, *context);
   return r;
 }
 
 inline ffxReturnCode_t HookFfxDestroyContext(ffxContext* context,
                                              const ffxAllocationCallbacks* memCb) {
-  return real_DestroyContext(context, memCb);
+  void* identity = context ? *context : nullptr;
+  const auto r = real_DestroyContext(context, memCb);
+  if (r == ffx_api::FFX_API_RETURN_OK) ForgetContext(identity);
+  return r;
 }
 
 inline ffxReturnCode_t HookFfxDispatch(ffxContext* context,
                                        const ffx_api::ffxDispatchDescHeader* desc) {
-  // Tick/classify/extract first (nr_fsr logs the first 3 dispatches), heartbeat,
-  // then the recording order around the trampoline: the ngx_probe evaluate
-  // hook's `pre` pattern copied verbatim (ngx_probe.hpp:297-301). Model resolution
-  // Render records into the upscale's color input first and the real dispatch then
-  // upscales the enhanced frame; model resolution Full runs the real dispatch first
-  // and records from its output. `pre` is decided before the record, so a model-
-  // resolution swap inside PrepareFsrPass lands on the next frame -- exactly how
-  // the DLSS path behaves when PreparePass swaps dlss_resolution.
-  nr_fsr::OnFfxDispatch(context, desc);
-  static uint32_t count = 0;
+  ffx_api::ffxDispatchDescUpscale resolved = {};
+  UpscaleContext info = {};
+  const auto* effective = desc;
+  bool ready = false;
+  if (desc && desc->type == FFX_API_DISPATCH_DESC_TYPE_UPSCALE) {
+    const auto& raw = *reinterpret_cast<const ffx_api::ffxDispatchDescUpscale*>(desc);
+    ready = ResolveDispatch(context ? *context : nullptr, raw, resolved, info);
+    if (dispatch_dumps.fetch_add(1, std::memory_order_relaxed) < 3)
+      ngx_probe::Logf("nr-fwd: FSR3 context=%p raw=%ux%u resolved=%ux%u max=%ux%u color-allocation=%ux%u output-allocation=%ux%u flags=0x%x render=%ux%u cmdlist=%p ready=%u",
+          context ? *context : nullptr, raw.upscaleSize.width, raw.upscaleSize.height,
+          resolved.upscaleSize.width, resolved.upscaleSize.height,
+          info.max_upscale_size.width, info.max_upscale_size.height,
+          raw.color.description.width, raw.color.description.height,
+          raw.output.description.width, raw.output.description.height, info.flags,
+          raw.renderSize.width, raw.renderSize.height, raw.commandList, unsigned(ready));
+    if (ready) effective = &resolved.header;
+    else {
+      static std::atomic<bool> said{false};
+      if (!said.exchange(true))
+        ngx_probe::Log("nr-fwd: FSR3 context missing or invalid upscale size -- pass skipped; recreate FSR context by changing quality; allocation size is not an upscale-size fallback");
+    }
+  }
+  if (ready || !desc || desc->type != FFX_API_DISPATCH_DESC_TYPE_UPSCALE)
+    nr_fsr::OnFfxDispatch(context ? *context : nullptr, effective, info.flags);
+  static std::atomic<uint32_t> count{0};
   const uint32_t n = ++count;
   if (n % kHeartbeatEvery == 0) {
     ngx_probe::Logf("ffx-probe: ffxDispatch #%u (alive)", n);
   }
   const bool pre = nr_runner::PreSr();
-  if (pre) nr_fsr::PreRecord(desc);
+  if (pre && ready) nr_fsr::PreRecord(effective, info.flags);
   const ffxReturnCode_t r = real_Dispatch(context, desc);
-  if (!pre && r == ffx_api::FFX_API_RETURN_OK) nr_fsr::PostRecord(desc);
+  if (!pre && ready && r == ffx_api::FFX_API_RETURN_OK)
+    nr_fsr::PostRecord(effective, info.flags);
   return r;
 }
 
@@ -496,19 +475,13 @@ inline bool blocked = false;  // a state Install must never retry out of
 // null until the attach succeeds.
 inline HMODULE upscaler_module = nullptr;
 
-// Try to attach to the first FFX loader/upscaler module present in the process.
-// Returns true once hooks are installed (further calls are no-ops). Cheap when
-// nothing is loaded yet -- safe to call every present until it succeeds.
-// All-or-nothing: every export the module provides is hooked, or none are.
 inline bool Install() {
   if (installed) return true;
   if (blocked) return false;
 
-  // Loader first (the surface games resolve through), upscaler DLL second. No
-  // scan of all loaded modules in v1: a game that ships a differently named
-  // module gets an explicit candidate added here instead.
   const char* candidates[] = {"amd_fidelityfx_loader_dx12.dll",
-                              "amd_fidelityfx_upscaler_dx12.dll"};
+                              "amd_fidelityfx_upscaler_dx12.dll",
+                              "amd_fidelityfx_dx12.dll"};
 
   HMODULE module = nullptr;
   const char* module_name = nullptr;
@@ -524,11 +497,6 @@ inline bool Install() {
 
   LONG* marker = ngx_probe::AttachedMarker("ffx");
   if (marker != nullptr && *marker != 0) {
-    // A previous image of this DLL was unloaded without detaching: its detours
-    // point into freed memory, and patching over them builds a jmp cycle (the
-    // GTA V Enhanced hang, issue #3). Nothing can repair the exports from here.
-    // The marker is keyed by probe (ngx_probe's guard comment): only a stale
-    // FFX detour of ours can be set here, and it blocks only this probe.
     ngx_probe::Warnf("ffx-probe: not hooking (marker)");
     blocked = true;
     return false;
@@ -545,13 +513,12 @@ inline bool Install() {
   for (const auto& entry : kHooks) {
     FARPROC proc = GetProcAddress(module, entry.export_name);
     if (proc == nullptr) {
-      // Not an error: a stripped module may carry only part of the API.
       ngx_probe::Logf("ffx-probe: %s not exported by %s", entry.export_name, module_name);
       continue;
     }
     *entry.real = reinterpret_cast<void*>(proc);
     if (DetourAttach(entry.real, entry.hook) != NO_ERROR) {
-      ngx_probe::Warnf("ffx-probe: DetourAttach failed for %s", entry.export_name);
+      ngx_probe::Warnf("ffx-probe: DetourAttach failed for %s!%s", module_name, entry.export_name);
       failed = true;
       break;
     }
@@ -577,7 +544,7 @@ inline bool Install() {
   if (marker != nullptr) *marker = 1;
   installed = true;
   upscaler_module = module;
-  ngx_probe::Logf("ffx-probe: hooked %d FFX exports on %s", attached, module_name);
+  ngx_probe::Logf("ffx-probe: hooked %d exports on %s", attached, module_name);
   return true;
 }
 
@@ -617,18 +584,16 @@ inline void Uninstall() {
   for (size_t i = 0; i < std::size(kHooks); ++i) {
     if (queued[i]) *kHooks[i].real = nullptr;
   }
-  installed = false;
+  installed = !all;
   if (all) upscaler_module = nullptr;
   if (LONG* marker = ngx_probe::AttachedMarker("ffx"); marker != nullptr) {
     // Our own marker: cleared only if all detached (a leak keeps the stale
     // state marked so the next image of this probe refuses to re-attach).
     *marker = all ? 0 : 1;
   }
-  ngx_probe::Logf("ffx-probe: detached %d FFX hooks", detached);
+  ngx_probe::Logf("ffx-probe: detached %d hooks", detached);
 }
 
 }  // namespace ffx_probe
 
 #endif  // NR_HOST_MOCK (Detours installation section)
-
-#endif  // !NR_HOST_MODE_CONTRACT_ERROR

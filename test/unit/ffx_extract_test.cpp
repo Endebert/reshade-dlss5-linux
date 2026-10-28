@@ -6,6 +6,8 @@
 
 #define NR_HOST_MOCK
 #include <cassert>
+#include <cstring>
+#include <type_traits>
 #include "../../src/ffx_api.hpp"    // vendored FFX types + ffx_probe decls + the extractors
 #include "../../src/nr_runner.hpp"  // host-mock build: State/Inputs/PassW/PassH
 
@@ -26,6 +28,125 @@ DWORD WaitForSingleObject(HANDLE, DWORD) { return 0; }
 UINT64 ID3D12Fence::GetCompletedValue() const { return 0; }
 HRESULT ID3D12Fence::SetEventOnCompletion(UINT64, HANDLE) { return 0; }
 void ID3D12Resource::Release() {}
+
+const IID __uuidof_placeholder_iid = {};
+
+namespace setup {
+
+HMODULE core = reinterpret_cast<HMODULE>(0xC0);
+ID3D12Device device;
+ID3D12GraphicsCommandList cmd;
+int init_calls = 0, caps_calls = 0, device_releases = 0;
+int init_result = 1;
+bool initialized = false;
+
+struct Parameters : NVSDK_NGX_Parameter {
+  NVSDK_NGX_Result Get(const char*, unsigned long long*) const override { return 0; }
+  NVSDK_NGX_Result Get(const char*, float*) const override { return 0; }
+  NVSDK_NGX_Result Get(const char*, double*) const override { return 0; }
+  NVSDK_NGX_Result Get(const char*, unsigned int*) const override { return 0; }
+  NVSDK_NGX_Result Get(const char*, int*) const override { return 0; }
+  NVSDK_NGX_Result Get(const char*, ID3D12Resource**) const override { return 0; }
+  NVSDK_NGX_Result Get(const char*, void**) const override { return 0; }
+  void Reset() override {}
+} params;
+
+int GetCaps(NVSDK_NGX_Parameter** out) {
+  ++caps_calls;
+  *out = initialized ? &params : nullptr;
+  return initialized ? NVSDK_NGX_Result_Success : 0;
+}
+
+int Init(unsigned long long app, const wchar_t* path, ID3D12Device* dev, int version,
+         const NVSDK_NGX_Parameter* config) {
+  ++init_calls;
+  assert(app == nr_runner::kStandaloneAppId);
+  assert(std::wcscmp(path, L"C:\\game") == 0);
+  assert(dev == &device);
+  assert(version == static_cast<int>(NVSDK_NGX_Version_API));
+  assert(config == nullptr);
+  initialized = init_result == 1;
+  return init_result;
+}
+
+void Reset(int source) {
+  nr_runner::s.source = source;
+  nr_runner::s.caps = nullptr;
+  nr_runner::s.ngx_core = nullptr;
+  nr_runner::s.forwarder = reinterpret_cast<HMODULE>(0xF0);
+  nr_runner::s.gave_up = false;
+  std::wcscpy(nr_runner::s.game_dir, L"C:\\game");
+  nr_runner::float_slot = 1;
+  init_calls = caps_calls = device_releases = 0;
+  init_result = 1;
+  initialized = false;
+}
+
+void TestFsrInitializesAfterCapsFailureAndRetries() {
+  Reset(nr_runner::kSrcFsr);
+  assert(!nr_runner::EnsureSetup(&cmd));
+  assert(init_calls == 1 && caps_calls == 1 && device_releases == 1);
+  assert(nr_runner::s.ngx_core == core);
+  assert(nr_runner::s.caps == nullptr && !nr_runner::s.gave_up);
+  assert(nr_runner::EnsureSetup(&cmd));
+  assert(nr_runner::s.caps == &params);
+  assert(init_calls == 1 && caps_calls == 2);
+}
+
+void TestDlssDoesNotInitializeAfterCapsFailure() {
+  Reset(nr_runner::kSrcDlss);
+  assert(!nr_runner::EnsureSetup(&cmd));
+  assert(!nr_runner::EnsureSetup(&cmd));
+  assert(init_calls == 0 && caps_calls == 2 && device_releases == 0);
+  assert(nr_runner::s.ngx_core == nullptr && !nr_runner::s.gave_up);
+}
+
+void TestInitializedFsrDoesNotRepeatInitOnCapsFailure() {
+  Reset(nr_runner::kSrcFsr);
+  nr_runner::s.ngx_core = core;
+  assert(!nr_runner::EnsureSetup(&cmd));
+  assert(!nr_runner::EnsureSetup(&cmd));
+  assert(init_calls == 0 && caps_calls == 2);
+  assert(nr_runner::s.ngx_core == core && !nr_runner::s.gave_up);
+}
+
+void TestFsrInitFailureIsHandled() {
+  Reset(nr_runner::kSrcFsr);
+  init_result = 0;
+  assert(!nr_runner::EnsureSetup(&cmd));
+  assert(init_calls == 1 && caps_calls == 1 && device_releases == 1);
+  assert(nr_runner::s.ngx_core == nullptr);
+  assert(nr_runner::s.caps == nullptr && nr_runner::s.gave_up);
+  nr_runner::s.gave_up = false;
+}
+
+}  // namespace setup
+
+DWORD GetModuleFileNameW(HMODULE, LPWSTR out, DWORD) {
+  std::wcscpy(out, L"C:\\game\\game.exe");
+  return 16;
+}
+int wcscpy_s(wchar_t* out, const wchar_t* in) { std::wcscpy(out, in); return 0; }
+int swprintf_s(wchar_t* out, const wchar_t*, ...) { out[0] = 0; return 0; }
+HMODULE LoadLibraryExW(LPCWSTR, HANDLE, DWORD) { return nullptr; }
+HMODULE LoadLibraryW(LPCWSTR) { return setup::core; }
+HMODULE GetModuleHandleA(const char* name) {
+  assert(std::strcmp(name, "_nvngx.dll") == 0);
+  return setup::core;
+}
+void* GetProcAddress(HMODULE module, const char* name) {
+  assert(module == setup::core);
+  if (std::strcmp(name, "NVSDK_NGX_D3D12_GetCapabilityParameters") == 0)
+    return reinterpret_cast<void*>(&setup::GetCaps);
+  if (std::strcmp(name, "NVSDK_NGX_D3D12_Init_Ext") == 0)
+    return reinterpret_cast<void*>(&setup::Init);
+  return nullptr;
+}
+HRESULT ID3D12CommandList::GetDevice(REFIID, void** out) {
+  *out = &setup::device;
+  return 0;
+}
+void ID3D12Device::Release() { ++setup::device_releases; }
 
 namespace {
 
@@ -165,6 +286,53 @@ namespace fsr {
 
 // 4. An upscale create-context desc through nr_fsr::OnFfxCreateContext stores its
 //    flags (Task 3's create hook); a non-upscale chain leaves them untouched.
+void TestZeroUpscaleSizeUsesContextMaximum() {
+  ffx::ffxCreateContextDescUpscale up = {};
+  up.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE;
+  up.maxUpscaleSize = {3840, 2160};
+  void* first = reinterpret_cast<void*>(0x1234);
+  void* second = reinterpret_cast<void*>(0x5678);
+  up.flags = ffx::FFX_UPSCALE_ENABLE_DEPTH_INVERTED;
+  nr_fsr::OnFfxCreateContext(&up.header, first);
+  up.maxUpscaleSize = {2560, 1440};
+  up.flags = 0;
+  nr_fsr::OnFfxCreateContext(&up.header, second);
+  auto d = MakeUpscaleDispatch();
+  d.upscaleSize = {0, 0};
+  d.output.description.width = 4096;
+  d.output.description.height = 4096;
+  ffx::ffxDispatchDescUpscale resolved = {};
+  ffx_probe::UpscaleContext info = {};
+  assert(ffx_probe::ResolveDispatch(first, d, resolved, info));
+  assert(resolved.upscaleSize.width == 3840 && resolved.upscaleSize.height == 2160);
+  assert(d.upscaleSize.width == 0 && d.upscaleSize.height == 0);
+  nr_fsr::OnFfxDispatch(first, &resolved.header, info.flags);
+  assert(nr_runner::s.dlss_out_w == 3840 && nr_runner::s.dlss_out_h == 2160);
+  assert(nr_fsr::last_inputs.depth_inverted);
+  assert(ffx_probe::ResolveDispatch(second, d, resolved, info));
+  assert(resolved.upscaleSize.width == 2560 && resolved.upscaleSize.height == 1440);
+  nr_fsr::OnFfxDispatch(second, &resolved.header, info.flags);
+  assert(!nr_fsr::last_inputs.depth_inverted);
+  assert((nr_runner::s.dlss_create_flags & NVSDK_NGX_DLSS_Feature_Flags_DepthInverted) == 0);
+  d.upscaleSize = {1920, 1080};
+  assert(ffx_probe::ResolveDispatch(first, d, resolved, info));
+  assert(resolved.upscaleSize.width == 1920 && resolved.upscaleSize.height == 1080);
+  d.upscaleSize = {0, 1080};
+  assert(!ffx_probe::ResolveDispatch(first, d, resolved, info));
+  assert(resolved.upscaleSize.width == 0 && resolved.upscaleSize.height == 1080);
+  ffx_probe::ForgetContext(first);
+  assert(!ffx_probe::ResolveDispatch(first, d, resolved, info));
+  d.upscaleSize = {0, 0};
+  assert(ffx_probe::ResolveDispatch(second, d, resolved, info));
+  assert(!ffx_probe::ResolveDispatch(nullptr, d, resolved, info));
+  up.maxUpscaleSize = {1600, 900};
+  nr_fsr::OnFfxCreateContext(&up.header, first);
+  assert(ffx_probe::ResolveDispatch(first, d, resolved, info));
+  assert(resolved.upscaleSize.width == 1600 && resolved.upscaleSize.height == 900);
+  ffx_probe::ForgetContext(first);
+  ffx_probe::ForgetContext(second);
+}
+
 void TestCreateContextCapturesUpscaleFlags() {
   nr_fsr::saw_upscale_create = false;
 
@@ -304,14 +472,217 @@ void TestZeroStampsNeverFresh() {
   assert(SourceChoice(kNow, 0, 0, nr_runner::kFsFsr) == -1);
 }
 
+void TestPassOwnerRejectsHeldToken() {
+  using namespace nr_runner;
+  assert(PassOwnerAcquire(kSrcDlss));
+  assert(!PassOwnerAcquire(kSrcDlss));
+  assert(!PassOwnerAcquire(kSrcFsr));
+  assert(pass_owner.load() == kSrcDlss);
+  PassOwnerRelease();
+  assert(PassOwnerAcquire(kSrcFsr));
+  PassOwnerRelease();
+}
+
+void TestPassGuardReleasesOnlyOwnedToken() {
+  using namespace nr_runner;
+  static_assert(!std::is_copy_constructible_v<PassGuard>);
+  static_assert(!std::is_copy_assignable_v<PassGuard>);
+  static_assert(!std::is_convertible_v<PassGuard, bool>);
+  {
+    PassGuard held(kSrcDlss);
+    assert(held);
+    {
+      PassGuard same(kSrcDlss);
+      PassGuard other(kSrcFsr);
+      assert(!same && !other);
+    }
+    assert(pass_owner.load() == kSrcDlss);
+    assert(!PassOwnerAcquire(kSrcFsr));
+  }
+  assert(pass_owner.load() == 0);
+  auto early_return = [] {
+    PassGuard held(kSrcFsr);
+    assert(held);
+    return;
+  };
+  early_return();
+  assert(PassOwnerAcquire(kSrcStandalone));
+  PassOwnerRelease();
+}
+
+void TestDlssCreateOnlyPublishesMetadata() {
+  using namespace nr_runner;
+  s.source = kSrcDlss;
+  s.render_w = s.dlss_render_w = 640;
+  s.render_h = s.dlss_render_h = 360;
+  s.out_w = s.dlss_out_w = 1280;
+  s.out_h = s.dlss_out_h = 720;
+  s.create_flags = s.dlss_create_flags = 0;
+  {
+    PassGuard held(kSrcDlss);
+    assert(held);
+    assert(!ApplyDlssGeometry());
+  }
+  OnDlssCreate(960, 540, 1920, 1080, 7);
+  assert(s.render_w == 640 && s.render_h == 360);
+  assert(s.out_w == 1280 && s.out_h == 720 && s.create_flags == 0);
+  assert(s.dlss_render_w == 640 && s.dlss_render_h == 360);
+  assert(s.dlss_out_w == 1280 && s.dlss_out_h == 720 && s.dlss_create_flags == 0);
+}
+
+void TestDlssCreateSurvivesContentionAndFsrGeometry() {
+  using namespace nr_runner;
+  s.source = kSrcDlss;
+  s.dlss_resolution = kResFull;
+  s.feature = reinterpret_cast<void*>(0xD155);
+  s.feature_w = 1280;
+  s.feature_h = 720;
+  {
+    PassGuard held(kSrcFsr);
+    assert(held);
+    OnDlssCreate(800, 450, 1600, 900, 3);
+    OnDlssCreate(960, 540, 1920, 1080, 7);
+    assert(s.feature != nullptr && s.out_w == 1280);
+    auto d = MakeUpscaleDispatch();
+    Inputs in;
+    ffx_probe::OnUpscaleGeometry(d, in);
+    assert(pass_owner.load() == kSrcFsr);
+  }
+  PassGuard held(kSrcDlss);
+  assert(held);
+  assert(ApplyDlssGeometry());
+  assert(s.dlss_render_w == 960 && s.dlss_render_h == 540);
+  assert(s.dlss_out_w == 1920 && s.dlss_out_h == 1080 && s.dlss_create_flags == 7);
+  assert(s.render_w == 960 && s.render_h == 540);
+  assert(s.out_w == 1920 && s.out_h == 1080 && s.create_flags == 7);
+  assert(s.feature == nullptr);
+  assert(s.graveyard.back().feature == reinterpret_cast<void*>(0xD155));
+  s.feature = reinterpret_cast<void*>(0xD156);
+  s.feature_w = 1920;
+  s.feature_h = 1080;
+  auto d = MakeUpscaleDispatch();
+  Inputs in;
+  ffx_probe::OnUpscaleGeometry(d, in);
+  s.render_w = s.render_h = s.out_w = s.out_h = 1;
+  s.create_flags = 0;
+  assert(ApplyDlssGeometry());
+  assert(s.render_w == 960 && s.render_h == 540);
+  assert(s.out_w == 1920 && s.out_h == 1080 && s.create_flags == 7);
+  assert(s.feature == reinterpret_cast<void*>(0xD156));
+  s.feature = nullptr;
+  s.graveyard.clear();
+}
+
+void TestDlssObservationRequiresCreate() {
+  using namespace nr_runner;
+  {
+    std::lock_guard<std::mutex> lock(dlss_geometry_mutex);
+    pending_dlss_geometry = {};
+  }
+  s.last_dlss_tick = 0;
+  assert(!BeginDlssObservation(&setup::cmd, &setup::params));
+  assert(s.last_dlss_tick == 0);
+  s.armed_tick = kNow - kStandaloneArmMs;
+  assert(SourceChoice(kNow, s.last_dlss_tick, 0, kFsAuto) == kSrcStandalone);
+  s.armed_tick = 0;
+}
+
+void TestRecordingModeIsAtomic() {
+  assert((std::is_same_v<decltype(nr_runner::s.dlss_resolution), std::atomic<int>>));
+}
+
+void TestRecordingModeRejectsStaleSelection() {
+  using namespace nr_runner;
+  const int old_source = s.source.load();
+  const int old_resolution = s.dlss_resolution.load();
+  for (const int source : {kSrcDlss, kSrcFsr}) {
+    s.source = source;
+    s.dlss_resolution = kResRender;
+    const bool pre = PreSr();
+    assert(pre);
+    s.dlss_resolution = kResFull;
+    {
+      PassGuard held(source);
+      assert(held);
+      assert(!RecordingModeMatches(pre));
+      assert(RecordingModeMatches(false));
+    }
+    const bool post = PreSr();
+    assert(!post);
+    s.dlss_resolution = kResRender;
+    {
+      PassGuard held(source);
+      assert(held);
+      assert(!RecordingModeMatches(post));
+      assert(RecordingModeMatches(true));
+    }
+  }
+  s.source = kSrcStandalone;
+  assert(RecordingModeMatches(false));
+  assert(!RecordingModeMatches(true));
+  s.source = old_source;
+  s.dlss_resolution = old_resolution;
+}
+
+void TestDlssObservationRefreshesContendedHeartbeat() {
+  using namespace nr_runner;
+  PassGuard held(kSrcStandalone);
+  assert(held);
+  s.last_dlss_tick = 0;
+  OnDlssCreate(960, 540, 1920, 1080, 0);
+  assert(BeginDlssObservation(&setup::cmd, &setup::params));
+  const auto first = s.last_dlss_tick.load();
+  assert(first != 0);
+  assert(!PassGuard(kSrcDlss));
+  assert(BeginDlssObservation(&setup::cmd, &setup::params));
+  assert(s.last_dlss_tick > first);
+  const auto second = s.last_dlss_tick.load();
+  assert(!BeginDlssObservation(nullptr, &setup::params));
+  assert(!BeginDlssObservation(&setup::cmd, nullptr));
+  assert(s.last_dlss_tick == second);
+  assert(pass_owner.load() == kSrcStandalone);
+}
+
+void TestFsrClaimRespectsHeldToken() {
+  using namespace nr_runner;
+  s.enabled = true;
+  s.frame_source = kFsFsr;
+  s.source = kSrcStandalone;
+  s.last_fsr_tick = kFresh;
+  s.last_dlss_tick = 0;
+  assert(PassOwnerAcquire(kSrcStandalone));
+  OnFsrDispatchClaim(kNow);
+  assert(s.source == kSrcStandalone);
+  assert(pass_owner.load() == kSrcStandalone);
+  PassOwnerRelease();
+  OnFsrDispatchClaim(kNow);
+  assert(s.source == kSrcFsr);
+  assert(pass_owner.load() == 0);
+  s.frame_source = kFsAuto;
+}
+
 }  // namespace arb
 
 int main() {
+  setup::TestFsrInitializesAfterCapsFailureAndRetries();
+  setup::TestDlssDoesNotInitializeAfterCapsFailure();
+  setup::TestInitializedFsrDoesNotRepeatInitOnCapsFailure();
+  setup::TestFsrInitFailureIsHandled();
+  arb::TestPassOwnerRejectsHeldToken();
+  arb::TestPassGuardReleasesOnlyOwnedToken();
+  arb::TestFsrClaimRespectsHeldToken();
+  arb::TestDlssCreateOnlyPublishesMetadata();
+  arb::TestDlssCreateSurvivesContentionAndFsrGeometry();
+  arb::TestRecordingModeIsAtomic();
+  arb::TestRecordingModeRejectsStaleSelection();
+  arb::TestDlssObservationRequiresCreate();
+  arb::TestDlssObservationRefreshesContendedHeartbeat();
   TestExtractFromUpscaleDispatch();
   TestRejectsNonUpscaleDispatch();
   TestGeometryFollowsColorAllocation();
   TestOutputFormatMapsFfxSurfaceFormat();
   TestTextureTypeRecognized();
+  fsr::TestZeroUpscaleSizeUsesContextMaximum();
   fsr::TestCreateContextCapturesUpscaleFlags();
   fsr::TestNonUpscaleDispatchTicksWithoutExtracting();
   fsr::TestUpscaleDispatchClassifiesAndExtracts();

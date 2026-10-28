@@ -362,8 +362,8 @@ float ReadWhitePoint(uint32_t frame);
 
 namespace ngx_probe {
 
-void Log(const char* msg);
-void Logf(const char* fmt, ...);
+inline void Log(const char*) {}
+inline void Logf(const char*, ...) {}
 void Warnf(const char* fmt, ...);
 
 }  // namespace ngx_probe
